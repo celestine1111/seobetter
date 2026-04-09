@@ -425,12 +425,12 @@ function fetchOpenDisease(keyword) {
     const global = await safeFetch('https://disease.sh/v3/covid-19/all');
     const stats = [];
     if (global) {
-      stats.push({ text: `Global COVID-19: ${(global.cases || 0).toLocaleString()} total cases, ${(global.deaths || 0).toLocaleString()} deaths, ${(global.recovered || 0).toLocaleString()} recovered (disease.sh, ${new Date(global.updated).toISOString().split('T')[0]})`, url: 'https://disease.sh/', source: 'disease.sh' });
+      stats.push({ text: `Global COVID-19: ${(global.cases || 0).toLocaleString()} total cases, ${(global.deaths || 0).toLocaleString()} deaths, ${(global.recovered || 0).toLocaleString()} recovered (disease.sh, ${new Date(global.updated).toISOString().split('T')[0]})`, url: 'https://www.worldometers.info/coronavirus/', source: 'Worldometers / disease.sh' });
     }
     // Also try influenza
     const flu = await safeFetch('https://disease.sh/v3/influenza/ihsg/summary');
     if (flu) {
-      stats.push({ text: `Latest influenza surveillance data available (WHO IHN, ${new Date().getFullYear()})`, url: 'https://disease.sh/', source: 'disease.sh / WHO' });
+      stats.push({ text: `Latest influenza surveillance data available (WHO IHN, ${new Date().getFullYear()})`, url: 'https://www.who.int/teams/global-influenza-programme/surveillance-and-monitoring', source: 'World Health Organization' });
     }
     return { stats };
   })() };
@@ -442,7 +442,7 @@ function fetchOpenFDA(keyword) {
     if (!data?.results?.length) return { stats: [] };
     return { stats: data.results.slice(0, 2).map(r => ({
       text: `FDA adverse event report: ${r.patient?.drug?.[0]?.medicinalproduct || keyword} — ${r.patient?.reaction?.map(rx => rx.reactionmeddrapt).join(', ') || 'reported'} (openFDA, ${r.receivedate || ''})`,
-      url: 'https://open.fda.gov/apis/drug/event/',
+      url: `https://api.fda.gov/drug/event.json?search=${encodeURIComponent(keyword)}&limit=1`,
       source: 'US FDA (openFDA)',
     }))};
   })() };
@@ -500,7 +500,7 @@ function fetchOpenMeteo(keyword) {
     const c = weather.current;
     return { stats: [{
       text: `Current weather in ${loc.name}, ${loc.country || ''}: ${c.temperature_2m}°C, wind ${c.wind_speed_10m} km/h, humidity ${c.relative_humidity_2m}% (Open-Meteo, ${new Date().toISOString().split('T')[0]})`,
-      url: 'https://open-meteo.com/',
+      url: `https://open-meteo.com/en/docs#latitude=${loc.latitude}&longitude=${loc.longitude}`,
       source: 'Open-Meteo',
     }]};
   })() };
@@ -556,14 +556,14 @@ function fetchBalldontlie(keyword) {
       if (!games?.data?.length) return { stats: [] };
       return { stats: games.data.map(g => ({
         text: `NBA: ${g.home_team?.full_name} ${g.home_team_score} vs ${g.visitor_team?.full_name} ${g.visitor_team_score} (${g.date?.split('T')[0]})`,
-        url: 'https://www.balldontlie.io/',
-        source: 'balldontlie',
+        url: `https://www.nba.com/game/${g.home_team?.abbreviation || ''}-vs-${g.visitor_team?.abbreviation || ''}`,
+        source: 'NBA',
       }))};
     }
     return { stats: data.data.map(p => ({
       text: `${p.first_name} ${p.last_name} — ${p.team?.full_name || ''}, position: ${p.position || 'N/A'} (balldontlie, ${new Date().getFullYear()})`,
-      url: 'https://www.balldontlie.io/',
-      source: 'balldontlie (NBA Data)',
+      url: `https://www.nba.com/player/${p.id || ''}/${(p.first_name||'').toLowerCase()}-${(p.last_name||'').toLowerCase()}`,
+      source: 'NBA',
     }))};
   })() };
 }
@@ -574,9 +574,10 @@ function fetchErgastF1() {
     const race = data?.MRData?.RaceTable?.Races?.[0];
     if (!race) return { stats: [] };
     const results = race.Results?.slice(0, 3) || [];
-    const stats = [{ text: `Latest F1 race: ${race.raceName} (${race.Circuit?.circuitName}, ${race.date}) (Ergast, ${new Date().getFullYear()})`, url: `https://ergast.com/mrd/`, source: 'Ergast F1 API' }];
+    const raceUrl = race.url || `https://www.formula1.com/en/results/${race.season}/${race.round}`;
+    const stats = [{ text: `Latest F1 race: ${race.raceName} (${race.Circuit?.circuitName}, ${race.date}) (Ergast, ${new Date().getFullYear()})`, url: raceUrl, source: 'Formula 1 / Ergast' }];
     results.forEach(r => {
-      stats.push({ text: `P${r.position}: ${r.Driver?.givenName} ${r.Driver?.familyName} (${r.Constructor?.name}) — ${r.Time?.time || r.status} (Ergast, ${new Date().getFullYear()})`, url: 'https://ergast.com/mrd/', source: 'Ergast F1' });
+      stats.push({ text: `P${r.position}: ${r.Driver?.givenName} ${r.Driver?.familyName} (${r.Constructor?.name}) — ${r.Time?.time || r.status} (Ergast, ${new Date().getFullYear()})`, url: r.Driver?.url || raceUrl, source: 'Formula 1 / Ergast' });
     });
     return { stats };
   })() };
@@ -589,7 +590,7 @@ function fetchOpenAQ() {
     if (!data?.results?.length) return { stats: [] };
     return { stats: data.results.slice(0, 3).map(r => ({
       text: `Air quality: ${r.location} (${r.country}) — PM2.5: ${r.measurements?.[0]?.value} ${r.measurements?.[0]?.unit} (OpenAQ, ${r.measurements?.[0]?.lastUpdated?.split('T')[0] || ''})`,
-      url: 'https://openaq.org/',
+      url: `https://openaq.org/locations/${r.id || ''}`,
       source: 'OpenAQ',
     }))};
   })() };
@@ -602,7 +603,7 @@ function fetchUKCarbon() {
     if (!entry) return { stats: [] };
     return { stats: [{
       text: `UK carbon intensity: ${entry.intensity?.actual || entry.intensity?.forecast} gCO2/kWh (${entry.intensity?.index || 'moderate'}) as of ${entry.from?.split('T')[0]} (National Grid ESO, ${new Date().getFullYear()})`,
-      url: 'https://carbonintensity.org.uk/',
+      url: 'https://carbonintensity.org.uk/intensity/stats',
       source: 'UK National Grid ESO',
     }]};
   })() };
@@ -913,8 +914,8 @@ function fetchCoinpaprika() {
     const data = await safeFetch('https://api.coinpaprika.com/v1/global');
     if (!data) return { stats: [] };
     return { stats: [
-      { text: `Global crypto market cap: $${(data.market_cap_usd / 1e12).toFixed(2)} trillion, ${data.cryptocurrencies_number?.toLocaleString()} cryptocurrencies tracked (Coinpaprika, ${new Date().toISOString().split('T')[0]})`, url: 'https://coinpaprika.com/', source: 'Coinpaprika' },
-      { text: `24h crypto volume: $${(data.volume_24h_usd / 1e9).toFixed(1)} billion, Bitcoin dominance: ${data.bitcoin_dominance_percentage?.toFixed(1)}% (Coinpaprika, ${new Date().toISOString().split('T')[0]})`, url: 'https://coinpaprika.com/', source: 'Coinpaprika' },
+      { text: `Global crypto market cap: $${(data.market_cap_usd / 1e12).toFixed(2)} trillion, ${data.cryptocurrencies_number?.toLocaleString()} cryptocurrencies tracked (Coinpaprika, ${new Date().toISOString().split('T')[0]})`, url: 'https://coinpaprika.com/market-overview/', source: 'Coinpaprika' },
+      { text: `24h crypto volume: $${(data.volume_24h_usd / 1e9).toFixed(1)} billion, Bitcoin dominance: ${data.bitcoin_dominance_percentage?.toFixed(1)}% (Coinpaprika, ${new Date().toISOString().split('T')[0]})`, url: 'https://coinpaprika.com/market-overview/', source: 'Coinpaprika' },
     ]};
   })() };
 }
@@ -925,7 +926,7 @@ function fetchCoinlore() {
     if (!data?.length) return { stats: [] };
     const g = data[0];
     return { stats: [
-      { text: `Total crypto coins: ${g.coins_count?.toLocaleString()}, active markets: ${g.active_markets?.toLocaleString()}, total market cap: $${(parseFloat(g.total_mcap) / 1e12).toFixed(2)}T (Coinlore, ${new Date().toISOString().split('T')[0]})`, url: 'https://www.coinlore.com/', source: 'Coinlore' },
+      { text: `Total crypto coins: ${g.coins_count?.toLocaleString()}, active markets: ${g.active_markets?.toLocaleString()}, total market cap: $${(parseFloat(g.total_mcap) / 1e12).toFixed(2)}T (Coinlore, ${new Date().toISOString().split('T')[0]})`, url: 'https://www.coinlore.com/cryptocurrency-data-api', source: 'Coinlore' },
     ]};
   })() };
 }
@@ -947,7 +948,7 @@ function fetchMempool() {
     const fees = await safeFetch('https://mempool.space/api/v1/fees/recommended');
     const stats = [];
     if (fees) {
-      stats.push({ text: `Bitcoin transaction fees: fastest ${fees.fastestFee} sat/vB, half hour ${fees.halfHourFee} sat/vB, economy ${fees.economyFee} sat/vB (Mempool.space, ${new Date().toISOString().split('T')[0]})`, url: 'https://mempool.space/', source: 'Mempool.space' });
+      stats.push({ text: `Bitcoin transaction fees: fastest ${fees.fastestFee} sat/vB, half hour ${fees.halfHourFee} sat/vB, economy ${fees.economyFee} sat/vB (Mempool.space, ${new Date().toISOString().split('T')[0]})`, url: 'https://mempool.space/graphs/mining/block-fee-rates', source: 'Mempool.space' });
     }
     const blocks = await safeFetch('https://mempool.space/api/blocks/tip/height');
     if (blocks) {
