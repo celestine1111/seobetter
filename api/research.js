@@ -269,10 +269,10 @@ async function searchBrave(keyword, apiKey) {
  */
 function getCategorySearches(domain, keyword) {
   const map = {
-    finance:        [() => fetchEcondb(keyword), () => fetchFedTreasury(), () => fetchSECEdgar(keyword), () => fetchWorldBank(keyword), () => fetchFreeDictionary(keyword)],
+    finance:        [() => fetchEcondb(keyword), () => fetchFedTreasury(), () => fetchSECEdgar(keyword), () => fetchWorldBank(keyword)],
     cryptocurrency: [() => fetchCoinGecko(keyword), () => fetchCoinCap(keyword), () => fetchCoinDesk(), () => fetchCoinpaprika(), () => fetchCoinlore(), () => fetchCryptoCompare(keyword), () => fetchMempool()],
     currency:       [() => fetchFrankfurter(), () => fetchCurrencyApi(), () => fetchWorldBank(keyword)],
-    health:         [() => fetchOpenDisease(keyword), () => fetchOpenFDA(keyword), () => fetchFreeDictionary(keyword)],
+    health:         [() => fetchOpenDisease(keyword), () => fetchOpenFDA(keyword)],
     science:        [() => fetchNASA(), () => fetchUSGSEarthquakes(), () => fetchLaunchLibrary(), () => fetchSpaceX(), () => fetchUSGSWater(), () => fetchSunriseSunset(), () => fetchNumberFacts(keyword), () => fetchCrossref(keyword)],
     weather:        [() => fetchOpenMeteo(keyword), () => fetchUSWeather(), () => fetchSunriseSunset(), () => fetchOpenAQ()],
     animals:        [() => fetchFishWatch(keyword), () => fetchZooAnimals(keyword), () => fetchDogFacts(), () => fetchCatFacts(), () => fetchMeowFacts()],
@@ -282,18 +282,18 @@ function getCategorySearches(domain, keyword) {
     books:          [() => fetchOpenLibrary(keyword), () => fetchPoetryDB(keyword), () => fetchCrossref(keyword), () => fetchQuotable(keyword)],
     government:     [() => fetchDataUSA(keyword), () => fetchFBIWanted(), () => fetchInterpolRedNotices(), () => fetchFederalRegister(), () => fetchNagerDate()],
     entertainment:  [() => fetchOpenTrivia(), () => fetchOMDb(keyword), () => fetchSWAPI(), () => fetchPokeApi(keyword), () => fetchQuotable(keyword)],
-    music:          [() => fetchMusicBrainz(keyword), () => fetchBandsintown(keyword), () => fetchFreeDictionary(keyword)],
+    music:          [() => fetchMusicBrainz(keyword), () => fetchBandsintown(keyword)],
     games:          [() => fetchFreeToGame(), () => fetchRAWG(keyword), () => fetchPokeApi(keyword), () => fetchOpenTrivia()],
     blockchain:     [() => fetchCoinGecko(keyword), () => fetchCoinCap(keyword), () => fetchMempool(), () => fetchCoinpaprika()],
     art_design:     [() => fetchArtInstitute(keyword), () => fetchMetMuseum(keyword)],
-    technology:     [() => fetchHackerNewsTop(), () => fetchCrossref(keyword), () => fetchFreeDictionary(keyword)],
+    technology:     [() => fetchHackerNewsTop(), () => fetchCrossref(keyword)],
     education:      [() => fetchUniversitiesList(keyword), () => fetchNobelPrize(keyword), () => fetchCrossref(keyword), () => fetchOpenLibrary(keyword), () => fetchWorldBank(keyword)],
     transportation: [() => fetchOpenSky(), () => fetchOpenChargeMap(keyword), () => fetchADSBExchange(), () => fetchCityBikes(), () => fetchNHTSA(keyword)],
     news:           [() => fetchSpaceflightNews(keyword), () => fetchHackerNewsTop(), () => fetchFederalRegister()],
-    ecommerce:      [() => fetchOpenFoodFacts(keyword), () => fetchFreeDictionary(keyword)],
+    ecommerce:      [() => fetchOpenFoodFacts(keyword)],
     law_government: [() => fetchFBIWanted(), () => fetchDataUSA(keyword), () => fetchInterpolRedNotices(), () => fetchFederalRegister(), () => fetchNagerDate()],
-    business:       [() => fetchEcondb(keyword), () => fetchWorldBank(keyword), () => fetchFedTreasury(), () => fetchFreeDictionary(keyword)],
-    general:        [() => fetchQuotable(keyword), () => fetchFreeDictionary(keyword), () => fetchNagerDate(), () => fetchNumberFacts(keyword)],
+    business:       [() => fetchEcondb(keyword), () => fetchWorldBank(keyword), () => fetchFedTreasury()],
+    general:        [() => fetchQuotable(keyword), () => fetchNagerDate(), () => fetchNumberFacts(keyword)],
   };
 
   const fns = map[domain] || [];
@@ -1346,15 +1346,23 @@ function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryD
   }
 
   // ---- Category-specific API data ----
+  // Low-authority sources: stats used by AI for context, but URLs excluded from references
+  const lowAuthority = new Set([
+    'Free Dictionary API', 'Numbers API', 'Zoo Animals API', 'Dog Facts API',
+    'Cat Facts API', 'MeowFacts', 'Fruityvice', 'Quotable', 'Open Trivia Database',
+    'SWAPI (Star Wars API)', 'PokéAPI', 'Currency Exchange API', 'ADS-B Exchange',
+  ]);
+
   if (categoryData?.length) {
     categoryData.forEach(cat => {
       const d = cat.data;
       if (!d) return;
-      // Each category API returns { stats: [{ text, url, source }] }
       if (d.stats?.length) {
         d.stats.forEach(s => {
+          // Always add stats — AI uses them for writing context
           stats.push(s.text);
-          if (s.url) {
+          // Only add authoritative sources to the references section
+          if (s.url && !lowAuthority.has(s.source)) {
             sources.push({ url: s.url, title: s.text.substring(0, 80), source_name: s.source || cat.source });
           }
         });
