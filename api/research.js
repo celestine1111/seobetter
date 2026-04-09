@@ -24,7 +24,7 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Use POST.' });
 
-  const { keyword, site_url, brave_key, domain } = req.body || {};
+  const { keyword, site_url, brave_key, domain, country } = req.body || {};
 
   if (!keyword) {
     return res.status(400).json({ error: 'keyword is required.' });
@@ -54,7 +54,10 @@ export default async function handler(req, res) {
 
     // Category-specific APIs — run in parallel based on domain
     const catEntries = getCategorySearches(domain || 'general', keyword);
-    const catPromises = catEntries.map(e => e.promise);
+    // Country-specific APIs — run in parallel based on country
+    const countryEntries = country ? getCountrySearches(country, keyword, domain) : [];
+    const allCatEntries = [...catEntries, ...countryEntries];
+    const catPromises = allCatEntries.map(e => e.promise);
 
     const [coreResults, catResults] = await Promise.all([
       Promise.all(freeSearches),
@@ -64,8 +67,8 @@ export default async function handler(req, res) {
     const [redditData, hnData, wikiData, trendsData, ...extraCore] = coreResults;
     const braveData = brave_key ? extraCore[0] : null;
 
-    // Pair category results with their metadata
-    const categoryData = catEntries.map((e, i) => ({
+    // Pair category + country results with their metadata
+    const categoryData = allCatEntries.map((e, i) => ({
       name: e.name,
       source: e.source,
       data: catResults[i],
@@ -302,6 +305,455 @@ function getCategorySearches(domain, keyword) {
     return { name: result.name, source: result.source, promise: result.promise };
   });
 }
+
+// ============================================================
+// COUNTRY-SPECIFIC API ROUTING
+// ============================================================
+
+/**
+ * Returns country-specific API searches based on country code.
+ * Uses generic CKAN fetcher for open data portals + specialized APIs per country.
+ */
+function getCountrySearches(country, keyword, domain) {
+  const c = COUNTRY_APIS[country?.toUpperCase()];
+  if (!c) return [];
+
+  const searches = [];
+
+  // 1. Open data portal (CKAN standard) — most countries have one
+  if (c.ckan) {
+    searches.push(fetchCKAN(c.ckan, keyword, c.name));
+  }
+
+  // 2. Statistics office API
+  if (c.stats) {
+    c.stats.forEach(s => searches.push(fetchGenericJSON(s.url, s.name, s.source, keyword)));
+  }
+
+  // 3. Central bank / economics
+  if (c.bank) {
+    c.bank.forEach(b => searches.push(fetchGenericJSON(b.url, b.name, b.source, keyword)));
+  }
+
+  // 4. Weather / environment
+  if (c.weather) {
+    c.weather.forEach(w => searches.push(fetchGenericJSON(w.url, w.name, w.source, keyword)));
+  }
+
+  // 5. Specialized APIs (earthquakes, health, transport, etc.)
+  if (c.specialized) {
+    c.specialized.forEach(s => searches.push(fetchGenericJSON(s.url, s.name, s.source, keyword)));
+  }
+
+  // 6. State/regional portals
+  if (c.regions) {
+    // Pick top 2 regional portals to keep request count reasonable
+    c.regions.slice(0, 2).forEach(r => {
+      if (r.ckan) searches.push(fetchCKAN(r.ckan, keyword, r.name));
+    });
+  }
+
+  return searches;
+}
+
+/** Generic CKAN data portal search — used by 100+ countries */
+function fetchCKAN(baseUrl, keyword, countryName) {
+  return { name: `${countryName} Open Data`, source: `${countryName} Government`, promise: (async () => {
+    const url = `${baseUrl}?q=${encodeURIComponent(keyword)}&rows=3`;
+    const data = await safeFetch(url);
+    if (!data?.result?.results?.length) return { stats: [] };
+    return { stats: data.result.results.slice(0, 3).map(d => ({
+      text: `${d.title || d.name}: ${(d.notes || d.description || '').substring(0, 120)} (${countryName} Government, ${d.metadata_modified?.split('T')[0] || new Date().getFullYear()})`,
+      url: d.url || `${baseUrl.replace('/api/3/action/package_search', '')}/dataset/${d.name || d.id}`,
+      source: `${countryName} Government Open Data`,
+    }))};
+  })() };
+}
+
+/** Generic JSON API fetch — for stats offices, central banks, etc. */
+function fetchGenericJSON(url, name, source, keyword) {
+  return { name, source, promise: (async () => {
+    const fullUrl = url.includes('?') ? url : (url.includes('{keyword}') ? url.replace('{keyword}', encodeURIComponent(keyword)) : url);
+    const data = await safeFetch(fullUrl);
+    if (!data) return { stats: [] };
+    // Try to extract useful text from the response
+    const text = typeof data === 'string' ? data.substring(0, 200) :
+                 Array.isArray(data) ? JSON.stringify(data[0] || {}).substring(0, 200) :
+                 JSON.stringify(data).substring(0, 200);
+    return { stats: [{
+      text: `${name}: data available for "${keyword}" (${source}, ${new Date().getFullYear()})`,
+      url: fullUrl.split('?')[0],
+      source,
+    }]};
+  })() };
+}
+
+/**
+ * Country API configurations.
+ * Each country has: ckan (open data portal), stats, bank, weather, specialized, regions.
+ */
+const COUNTRY_APIS = {
+  // ===== OCEANIA =====
+  AU: {
+    name: 'Australia',
+    ckan: 'https://data.gov.au/data/api/3/action/package_search',
+    stats: [
+      { url: 'https://api.data.abs.gov.au/data/ABS,CPI,1.0.0/all', name: 'ABS Statistics', source: 'Australian Bureau of Statistics' },
+    ],
+    bank: [
+      { url: 'https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/accounting/od/rates_of_exchange?sort=-record_date&page[size]=3&filter=country:eq:Australia', name: 'AU Exchange Rate', source: 'Reserve Bank of Australia' },
+    ],
+    weather: [
+      { url: 'http://www.bom.gov.au/fwo/IDN60901/IDN60901.94767.json', name: 'BOM Weather Sydney', source: 'Bureau of Meteorology' },
+    ],
+    specialized: [
+      { url: 'https://earthquakes.ga.gov.au/earthquake/getEarthquakes', name: 'AU Earthquakes', source: 'Geoscience Australia' },
+      { url: 'https://api.trove.nla.gov.au/v3/result?q={keyword}&category=newspaper&encoding=json&n=3', name: 'Trove Archives', source: 'National Library of Australia' },
+      { url: 'https://sws-data.sws.bom.gov.au/api/v1/get-aurora-outlook', name: 'Space Weather AU', source: 'Bureau of Meteorology Space Weather' },
+      { url: 'https://data.melbourne.vic.gov.au/api/explore/v2.1/catalog/datasets?limit=3&search={keyword}', name: 'Melbourne Open Data', source: 'City of Melbourne' },
+    ],
+    regions: [
+      { name: 'NSW', ckan: 'https://data.nsw.gov.au/data/api/3/action/package_search' },
+      { name: 'Victoria', ckan: 'https://discover.data.vic.gov.au/api/3/action/package_search' },
+      { name: 'Queensland', ckan: 'https://www.data.qld.gov.au/api/3/action/package_search' },
+      { name: 'Western Australia', ckan: 'https://catalogue.data.wa.gov.au/api/3/action/package_search' },
+      { name: 'South Australia', ckan: 'https://data.sa.gov.au/data/api/3/action/package_search' },
+    ],
+  },
+  NZ: {
+    name: 'New Zealand',
+    ckan: 'https://catalogue.data.govt.nz/api/3/action/package_search',
+    specialized: [
+      { url: 'https://api.geonet.org.nz/quake?MMI=3', name: 'NZ Earthquakes', source: 'GeoNet NZ' },
+      { url: 'https://api.geonet.org.nz/volcano/val', name: 'NZ Volcanoes', source: 'GeoNet NZ' },
+    ],
+  },
+  // ===== NORTH AMERICA =====
+  US: {
+    name: 'United States',
+    ckan: 'https://catalog.data.gov/api/3/action/package_search',
+    stats: [
+      { url: 'https://api.census.gov/data.json', name: 'US Census', source: 'US Census Bureau' },
+    ],
+    bank: [
+      { url: 'https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/accounting/od/rates_of_exchange?sort=-record_date&page[size]=5', name: 'US Treasury', source: 'US Treasury Department' },
+    ],
+    weather: [
+      { url: 'https://api.weather.gov/alerts/active?limit=3&severity=severe', name: 'NWS Alerts', source: 'US National Weather Service' },
+    ],
+    specialized: [
+      { url: 'https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson&limit=3&orderby=time&minmagnitude=4', name: 'USGS Earthquakes', source: 'USGS' },
+      { url: 'https://api.fda.gov/drug/event.json?limit=3', name: 'FDA Drug Events', source: 'US FDA' },
+      { url: 'https://api.federalregister.gov/v1/documents.json?per_page=3&order=newest', name: 'Federal Register', source: 'Federal Register' },
+    ],
+    regions: [
+      { name: 'New York', ckan: 'https://data.cityofnewyork.us/api/views/metadata/v1' },
+      { name: 'California', ckan: 'https://data.ca.gov/api/3/action/package_search' },
+    ],
+  },
+  CA: {
+    name: 'Canada',
+    ckan: 'https://open.canada.ca/data/api/3/action/package_search',
+    bank: [
+      { url: 'https://www.bankofcanada.ca/valet/observations/FXUSDCAD/json?recent=1', name: 'Bank of Canada', source: 'Bank of Canada' },
+    ],
+    weather: [
+      { url: 'https://api.weather.gc.ca/collections/hydrometric-daily-mean/items?limit=3', name: 'Canada Weather', source: 'Environment Canada' },
+    ],
+    specialized: [
+      { url: 'https://earthquakescanada.nrcan.gc.ca/api/earthquakes/latest', name: 'Canada Earthquakes', source: 'NRCan' },
+    ],
+    regions: [
+      { name: 'Ontario', ckan: 'https://data.ontario.ca/api/3/action/package_search' },
+      { name: 'British Columbia', ckan: 'https://catalogue.data.gov.bc.ca/api/3/action/package_search' },
+      { name: 'Toronto', ckan: 'https://open.toronto.ca/api/3/action/package_search' },
+    ],
+  },
+  MX: {
+    name: 'Mexico',
+    ckan: 'https://datos.gob.mx/busca/api/3/action/package_search',
+    bank: [
+      { url: 'https://www.banxico.org.mx/SieAPIRest/service/v1/series/SF43718/datos/oportuno?token=', name: 'Banxico', source: 'Banco de México' },
+    ],
+  },
+  // ===== EUROPE — WESTERN =====
+  GB: {
+    name: 'United Kingdom',
+    ckan: 'https://data.gov.uk/api/3/action/package_search',
+    stats: [
+      { url: 'https://api.beta.ons.gov.uk/v1/datasets?limit=3', name: 'ONS Statistics', source: 'Office for National Statistics' },
+    ],
+    bank: [
+      { url: 'https://api.carbonintensity.org.uk/intensity', name: 'UK Carbon', source: 'National Grid ESO' },
+    ],
+    weather: [
+      { url: 'https://environment.data.gov.uk/flood-monitoring/id/floods?_limit=3', name: 'UK Floods', source: 'Environment Agency' },
+    ],
+    specialized: [
+      { url: 'https://data.police.uk/api/crimes-street/all-crime?lat=51.5074&lng=-0.1278&date=2024-01', name: 'UK Police Data', source: 'UK Police' },
+      { url: 'https://api.nhs.uk/conditions?limit=3', name: 'NHS Health', source: 'NHS UK' },
+    ],
+  },
+  IE: {
+    name: 'Ireland',
+    ckan: 'https://data.gov.ie/api/3/action/package_search',
+    stats: [
+      { url: 'https://ws.cso.ie/public/api.restful/PxStat.Data.Cube_API.ReadDataset/CPI01/JSON-stat/2.0/en', name: 'CSO Statistics', source: 'Central Statistics Office Ireland' },
+    ],
+  },
+  FR: {
+    name: 'France',
+    ckan: 'https://www.data.gouv.fr/api/1/datasets/?q={keyword}&page_size=3',
+    stats: [
+      { url: 'https://api.insee.fr/catalogue/', name: 'INSEE Statistics', source: 'INSEE France' },
+    ],
+    specialized: [
+      { url: 'https://recherche-entreprises.api.gouv.fr/search?q={keyword}&per_page=3', name: 'French Companies', source: 'French Government' },
+    ],
+  },
+  DE: {
+    name: 'Germany',
+    ckan: 'https://www.govdata.de/ckan/api/3/action/package_search',
+    bank: [
+      { url: 'https://opendata.bundesbank.de/api/v1/data?limit=3', name: 'Bundesbank', source: 'Deutsche Bundesbank' },
+    ],
+  },
+  ES: {
+    name: 'Spain',
+    ckan: 'https://datos.gob.es/apidata/catalog/dataset?q={keyword}&_pageSize=3',
+  },
+  PT: {
+    name: 'Portugal',
+    ckan: 'https://dados.gov.pt/api/1/datasets/?q={keyword}&page_size=3',
+  },
+  IT: {
+    name: 'Italy',
+    ckan: 'https://www.dati.gov.it/opendata/api/3/action/package_search',
+  },
+  NL: {
+    name: 'Netherlands',
+    ckan: 'https://data.overheid.nl/data/api/3/action/package_search',
+    stats: [
+      { url: 'https://opendata.cbs.nl/ODataApi/odata/83913ENG/TypedDataSet?$top=3', name: 'CBS Statistics', source: 'Statistics Netherlands' },
+    ],
+  },
+  BE: {
+    name: 'Belgium',
+    ckan: 'https://data.gov.be/api/3/action/package_search',
+  },
+  CH: {
+    name: 'Switzerland',
+    ckan: 'https://opendata.swiss/api/3/action/package_search',
+  },
+  AT: {
+    name: 'Austria',
+    ckan: 'https://www.data.gv.at/katalog/api/3/action/package_search',
+  },
+  LU: { name: 'Luxembourg', ckan: 'https://data.public.lu/api/1/datasets/?q={keyword}&page_size=3' },
+  GR: { name: 'Greece', ckan: 'https://data.gov.gr/api/v1/query/mdg_emvolio?limit=3' },
+  CY: { name: 'Cyprus', ckan: 'https://www.data.gov.cy/api/3/action/package_search' },
+  MT: { name: 'Malta', ckan: 'https://data.gov.mt/api/3/action/package_search' },
+  // ===== EUROPE — NORDIC =====
+  SE: {
+    name: 'Sweden',
+    ckan: 'https://catalog.dataportal.se/api/3/action/package_search',
+    bank: [
+      { url: 'https://api.riksbank.se/swea/v1/CrossRates/Latest', name: 'Riksbank', source: 'Sveriges Riksbank' },
+    ],
+  },
+  NO: {
+    name: 'Norway',
+    ckan: 'https://data.norge.no/api/dcat/search?q={keyword}&limit=3',
+    weather: [
+      { url: 'https://frost.met.no/sources/v0.jsonld?types=SensorSystem&elements=air_temperature&geometry=nearest(POINT(10.72 59.93))', name: 'Norway Weather', source: 'MET Norway' },
+    ],
+  },
+  DK: {
+    name: 'Denmark',
+    ckan: 'https://www.opendata.dk/api/3/action/package_search',
+    stats: [
+      { url: 'https://api.statbank.dk/v1/tables?lang=en&format=JSON', name: 'Denmark Statistics', source: 'Statistics Denmark' },
+    ],
+  },
+  FI: {
+    name: 'Finland',
+    ckan: 'https://www.avoindata.fi/data/api/3/action/package_search',
+  },
+  IS: { name: 'Iceland', ckan: 'https://opingogn.is/api/3/action/package_search' },
+  EE: { name: 'Estonia', ckan: 'https://avaandmed.eesti.ee/api/' },
+  LV: { name: 'Latvia', ckan: 'https://data.gov.lv/dati/eng/api/3/action/package_search' },
+  LT: { name: 'Lithuania', ckan: 'https://data.gov.lt/api/3/action/package_search' },
+  // ===== EUROPE — CENTRAL & EASTERN =====
+  PL: {
+    name: 'Poland',
+    ckan: 'https://api.dane.gov.pl/1.4/datasets?q={keyword}&per_page=3',
+    bank: [
+      { url: 'https://api.nbp.pl/api/exchangerates/tables/A/?format=json', name: 'NBP Exchange', source: 'National Bank of Poland' },
+    ],
+  },
+  CZ: { name: 'Czech Republic', ckan: 'https://data.gov.cz/api/v2/datasets' },
+  SK: { name: 'Slovakia', ckan: 'https://data.gov.sk/api/3/action/package_search' },
+  HU: { name: 'Hungary', ckan: 'https://data.gov.hu/api/3/action/package_search' },
+  SI: { name: 'Slovenia', ckan: 'https://podatki.gov.si/api/3/action/package_search' },
+  HR: { name: 'Croatia', ckan: 'https://data.gov.hr/api/3/action/package_search' },
+  RS: { name: 'Serbia', ckan: 'https://data.gov.rs/sr/api/3/action/package_search' },
+  BG: { name: 'Bulgaria', ckan: 'https://data.egov.bg/api/' },
+  RO: { name: 'Romania', ckan: 'https://data.gov.ro/api/3/action/package_search' },
+  UA: {
+    name: 'Ukraine',
+    ckan: 'https://data.gov.ua/api/3/action/package_search',
+    bank: [
+      { url: 'https://bank.gov.ua/NBU_Exchange/exchange?json', name: 'NBU Exchange', source: 'National Bank of Ukraine' },
+    ],
+  },
+  MD: { name: 'Moldova', ckan: 'https://date.gov.md/api/3/action/package_search' },
+  MK: { name: 'North Macedonia', ckan: 'https://data.gov.mk/api/3/action/package_search' },
+  AL: { name: 'Albania', ckan: 'https://opendata.gov.al/api/3/action/package_search' },
+  BA: { name: 'Bosnia', ckan: 'https://opendata.gov.ba/api/3/action/package_search' },
+  ME: { name: 'Montenegro', ckan: 'https://data.gov.me/api/3/action/package_search' },
+  XK: { name: 'Kosovo', ckan: 'https://opendata.rks-gov.net/api/3/action/package_search' },
+  RU: {
+    name: 'Russia',
+    bank: [
+      { url: 'https://www.cbr-xml-daily.ru/daily_json.js', name: 'CBR Exchange', source: 'Central Bank of Russia' },
+    ],
+  },
+  TR: {
+    name: 'Turkey',
+    ckan: 'https://data.ibb.gov.tr/api/3/action/package_search',
+  },
+  // ===== ASIA =====
+  JP: {
+    name: 'Japan',
+    specialized: [
+      { url: 'https://www.e-stat.go.jp/api/api-info', name: 'Japan Statistics', source: 'Statistics Japan (e-Stat)' },
+    ],
+  },
+  KR: {
+    name: 'South Korea',
+    specialized: [
+      { url: 'https://kosis.kr/openapi/', name: 'KOSIS Statistics', source: 'Statistics Korea' },
+    ],
+  },
+  CN: {
+    name: 'China',
+    specialized: [
+      { url: 'https://api.data.gov.hk/v2/filter?q=popular&sort=year', name: 'HK Open Data', source: 'Hong Kong Government' },
+    ],
+  },
+  TW: { name: 'Taiwan', ckan: 'https://data.gov.tw/api/' },
+  SG: {
+    name: 'Singapore',
+    specialized: [
+      { url: 'https://api.data.gov.sg/v1/environment/air-temperature', name: 'SG Environment', source: 'Singapore Government' },
+    ],
+  },
+  MY: {
+    name: 'Malaysia',
+    specialized: [
+      { url: 'https://api.data.gov.my/data-catalogue?limit=3', name: 'Malaysia Data', source: 'Malaysian Government' },
+    ],
+  },
+  ID: { name: 'Indonesia', ckan: 'https://data.go.id/api/3/action/package_search' },
+  PH: { name: 'Philippines', ckan: 'https://data.gov.ph/api/3/action/package_search' },
+  TH: { name: 'Thailand', ckan: 'https://data.go.th/api/3/action/package_search' },
+  VN: { name: 'Vietnam', ckan: 'https://data.gov.vn/api/3/action/package_search' },
+  IN: {
+    name: 'India',
+    specialized: [
+      { url: 'https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070?api-key=579b464db66ec23bdd000001cdd3946e44ce4aad7209ff7b23ac571b&format=json&limit=3', name: 'India Open Data', source: 'Indian Government' },
+    ],
+  },
+  PK: { name: 'Pakistan', ckan: 'https://opendata.com.pk/api/3/action/package_search' },
+  BD: { name: 'Bangladesh', ckan: 'https://data.gov.bd/api/3/action/package_search' },
+  LK: { name: 'Sri Lanka', ckan: 'https://data.gov.lk/api/3/action/package_search' },
+  NP: { name: 'Nepal', ckan: 'https://data.opennepal.net/api/3/action/package_search' },
+  MV: { name: 'Maldives', ckan: 'https://data.gov.mv/api/3/action/package_search' },
+  MN: { name: 'Mongolia', ckan: 'https://opendata.gov.mn/api/3/action/package_search' },
+  KZ: { name: 'Kazakhstan', ckan: 'https://data.egov.kz/api/v4/' },
+  UZ: { name: 'Uzbekistan', ckan: 'https://data.gov.uz/api/3/action/package_search' },
+  KG: { name: 'Kyrgyzstan', ckan: 'https://data.gov.kg/api/3/action/package_search' },
+  // ===== MIDDLE EAST =====
+  IL: {
+    name: 'Israel',
+    ckan: 'https://data.gov.il/api/3/action/package_search',
+  },
+  AE: {
+    name: 'UAE',
+    specialized: [
+      { url: 'https://bayanat.ae/en/Organization/Opendata/API', name: 'UAE Open Data', source: 'UAE Government' },
+    ],
+  },
+  SA: { name: 'Saudi Arabia', specialized: [{ url: 'https://open.data.gov.sa/api/datasets/', name: 'Saudi Open Data', source: 'Saudi Government' }] },
+  QA: { name: 'Qatar', specialized: [{ url: 'https://www.data.gov.qa/api/', name: 'Qatar Open Data', source: 'Qatar Government' }] },
+  BH: { name: 'Bahrain', specialized: [{ url: 'https://www.data.gov.bh/api/', name: 'Bahrain Open Data', source: 'Bahrain Government' }] },
+  KW: { name: 'Kuwait', ckan: 'https://data.gov.kw/api/3/action/package_search' },
+  OM: { name: 'Oman', ckan: 'https://data.gov.om/api/3/action/package_search' },
+  JO: { name: 'Jordan', specialized: [{ url: 'http://dosweb.dos.gov.jo/api/', name: 'Jordan Statistics', source: 'Jordan Government' }] },
+  // ===== LATIN AMERICA =====
+  BR: {
+    name: 'Brazil',
+    ckan: 'https://dados.gov.br/api/publico/conjuntos-dados?istipoconjuntodados=true&pagina=1&tamanhoPagina=3',
+    stats: [
+      { url: 'https://servicodados.ibge.gov.br/api/v3/agregados?localidade=N1', name: 'IBGE Statistics', source: 'IBGE Brazil' },
+    ],
+    bank: [
+      { url: 'https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata/CotacaoDolarDia(dataCotacao=@dataCotacao)?@dataCotacao=%272024-01-15%27&$format=json', name: 'BCB Exchange', source: 'Central Bank of Brazil' },
+    ],
+  },
+  AR: {
+    name: 'Argentina',
+    ckan: 'https://datos.gob.ar/api/3/action/package_search',
+    bank: [
+      { url: 'https://api.bcra.gob.ar/estadisticas/v3.0/DatosVariable/6/2024-01-01/2024-12-31', name: 'BCRA Statistics', source: 'Central Bank of Argentina' },
+    ],
+  },
+  CL: {
+    name: 'Chile',
+    ckan: 'https://datos.gob.cl/api/3/action/package_search',
+    bank: [
+      { url: 'https://mindicador.cl/api', name: 'Chile Indicators', source: 'mindicador.cl' },
+    ],
+  },
+  CO: { name: 'Colombia', ckan: 'https://www.datos.gov.co/resource/' },
+  PE: { name: 'Peru', ckan: 'https://www.datosabiertos.gob.pe/api/3/action/package_search' },
+  UY: { name: 'Uruguay', ckan: 'https://catalogodatos.gub.uy/api/3/action/package_search' },
+  PY: { name: 'Paraguay', ckan: 'https://www.datos.gov.py/api/3/action/package_search' },
+  EC: { name: 'Ecuador', ckan: 'https://www.datosabiertos.gob.ec/api/3/action/package_search' },
+  BO: { name: 'Bolivia', ckan: 'https://datos.gob.bo/api/3/action/package_search' },
+  CR: { name: 'Costa Rica', ckan: 'https://datosabiertos.presidencia.go.cr/api/3/action/package_search' },
+  PA: { name: 'Panama', ckan: 'https://www.datosabiertos.gob.pa/api/3/action/package_search' },
+  DO: { name: 'Dominican Republic', ckan: 'https://datos.gob.do/api/3/action/package_search' },
+  GT: { name: 'Guatemala', ckan: 'https://www.datos.gob.gt/api/3/action/package_search' },
+  SV: { name: 'El Salvador', ckan: 'https://www.datosabiertos.gob.sv/api/3/action/package_search' },
+  JM: { name: 'Jamaica', ckan: 'https://data.gov.jm/api/3/action/package_search' },
+  TT: { name: 'Trinidad', ckan: 'https://data.tt/api/3/action/package_search' },
+  // ===== AFRICA =====
+  ZA: {
+    name: 'South Africa',
+    specialized: [
+      { url: 'https://wazimap.co.za/api/v1/profiles/country-ZA/', name: 'SA Demographics', source: 'Wazimap South Africa' },
+      { url: 'https://municipalmoney.gov.za/api/', name: 'SA Municipal Finance', source: 'South African Government' },
+    ],
+  },
+  NG: { name: 'Nigeria', ckan: 'https://data.gov.ng/api/3/action/package_search' },
+  KE: { name: 'Kenya', specialized: [{ url: 'https://www.opendata.go.ke/api/', name: 'Kenya Open Data', source: 'Kenya Government' }] },
+  GH: { name: 'Ghana', ckan: 'https://data.gov.gh/api/3/action/package_search' },
+  TZ: { name: 'Tanzania', ckan: 'https://opendata.go.tz/api/3/action/package_search' },
+  UG: { name: 'Uganda', ckan: 'https://data.ubos.org/api/3/action/package_search' },
+  RW: { name: 'Rwanda', specialized: [{ url: 'https://statistics.gov.rw/api/', name: 'Rwanda Statistics', source: 'Rwanda Government' }] },
+  EG: { name: 'Egypt', specialized: [{ url: 'https://www.capmas.gov.eg/api/', name: 'Egypt Statistics', source: 'CAPMAS Egypt' }] },
+  MA: { name: 'Morocco', specialized: [{ url: 'https://data.gov.ma/data/fr/api/', name: 'Morocco Open Data', source: 'Morocco Government' }] },
+  TN: { name: 'Tunisia', ckan: 'https://www.data.gov.tn/fr/api/3/action/package_search' },
+  SN: { name: 'Senegal', ckan: 'https://www.data.gouv.sn/api/3/action/package_search' },
+  CI: { name: 'Ivory Coast', ckan: 'https://data.gouv.ci/api/3/action/package_search' },
+  CM: { name: 'Cameroon', ckan: 'https://www.data.gov.cm/api/3/action/package_search' },
+  BF: { name: 'Burkina Faso', ckan: 'https://data.gov.bf/api/3/action/package_search' },
+  BJ: { name: 'Benin', ckan: 'https://data.gouv.bj/api/3/action/package_search' },
+  TG: { name: 'Togo', ckan: 'https://data.gouv.tg/api/3/action/package_search' },
+  // ===== PACIFIC =====
+  FJ: { name: 'Pacific Islands', ckan: 'https://pacificdata.org/data/api/3/action/package_search' },
+};
 
 /** Helper: fetch with 6s timeout, return empty on failure */
 async function safeFetch(url, options = {}) {
