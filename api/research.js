@@ -45,6 +45,7 @@ export default async function handler(req, res) {
       searchHackerNews(keyword),
       searchWikipedia(keyword),
       searchGoogleTrends(keyword),
+      searchDuckDuckGo(keyword),
     ];
 
     // Pro source — only if Brave key provided
@@ -64,7 +65,7 @@ export default async function handler(req, res) {
       Promise.all(catPromises),
     ]);
 
-    const [redditData, hnData, wikiData, trendsData, ...extraCore] = coreResults;
+    const [redditData, hnData, wikiData, trendsData, ddgData, ...extraCore] = coreResults;
     const braveData = brave_key ? extraCore[0] : null;
 
     // Pair category + country results with their metadata
@@ -74,7 +75,7 @@ export default async function handler(req, res) {
       data: catResults[i],
     }));
 
-    const result = buildResearchResult(keyword, redditData, hnData, wikiData, trendsData, braveData, categoryData, domain);
+    const result = buildResearchResult(keyword, redditData, hnData, wikiData, trendsData, braveData, categoryData, domain, ddgData);
 
     return res.status(200).json(result);
   } catch (err) {
@@ -259,6 +260,57 @@ async function searchBrave(keyword, apiKey) {
   } catch (err) {
     return { results: [], error: err.message };
   }
+}
+
+// ============================================================
+// DUCKDUCKGO WEB SEARCH (free, no API key, real URLs)
+// ============================================================
+
+/**
+ * Search DuckDuckGo for web results with real URLs.
+ * Uses DDG's HTML endpoint (same as the ddgs Python library).
+ * Returns real authoritative web pages for article citations.
+ */
+async function searchDuckDuckGo(keyword) {
+  try {
+    const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(keyword)}`;
+    const resp = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!resp.ok) return { results: [] };
+
+    const html = await resp.text();
+
+    // Parse DDG HTML results — extract links and snippets
+    const results = [];
+    const linkRegex = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)<\/a>/gs;
+    const snippetRegex = /<a[^>]+class="result__snippet"[^>]*>(.*?)<\/a>/gs;
+
+    const links = [...html.matchAll(linkRegex)];
+    const snippets = [...html.matchAll(snippetRegex)];
+
+    for (let i = 0; i < Math.min(links.length, 8); i++) {
+      let href = links[i][1];
+      // DDG wraps URLs in a redirect — extract the actual URL
+      const udMatch = href.match(/uddg=([^&]+)/);
+      if (udMatch) href = decodeURIComponent(udMatch[1]);
+
+      const title = links[i][2].replace(/<[^>]+>/g, '').trim();
+      const snippet = snippets[i] ? snippets[i][1].replace(/<[^>]+>/g, '').trim() : '';
+
+      if (href.startsWith('http') && title) {
+        try {
+          const hostname = new URL(href).hostname.replace('www.', '');
+          results.push({ title, url: href, snippet, source: hostname });
+        } catch { /* skip invalid URLs */ }
+      }
+    }
+
+    return { results };
+  } catch { return { results: [] }; }
 }
 
 // ============================================================
@@ -1692,7 +1744,7 @@ function fetchSpaceflightNews(keyword) {
 // BUILD RESULT
 // ============================================================
 
-function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryData, domain) {
+function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryData, domain, ddg) {
   const now = new Date();
   const monthYear = now.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
   const year = now.getFullYear();
@@ -1791,6 +1843,24 @@ function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryD
     });
   }
 
+  // ---- DuckDuckGo Web Search (real authoritative URLs for citations) ----
+  if (ddg?.results?.length) {
+    ddg.results.forEach(r => {
+      // Extract statistics from snippets
+      const statMatches = r.snippet?.match(/\d[\d,\.]*\s*(?:billion|million|thousand|percent|%|\$|USD|EUR)/gi);
+      if (statMatches) {
+        statMatches.slice(0, 2).forEach(s => {
+          stats.push(`${s} — ${r.source} (${year})`);
+        });
+      }
+      sources.push({
+        url: r.url,
+        title: r.title,
+        source_name: r.source,
+      });
+    });
+  }
+
   // ---- Google Trends (related topics) ----
   if (trends?.topics?.length) {
     trends.topics.slice(0, 3).forEach(t => {
@@ -1838,7 +1908,7 @@ function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryD
   const catNames = (categoryData || []).filter(c => c.data?.stats?.length).map(c => c.name);
   const catLabel = catNames.length ? `, ${catNames.join(', ')}` : '';
   p.push(`REAL-TIME RESEARCH DATA (${monthYear}):`);
-  p.push(`Topic: "${keyword}" (${domain || 'general'}) — researched across Wikipedia, Reddit, Hacker News${brave ? ', Brave Web Search' : ''}${catLabel}\n`);
+  p.push(`Topic: "${keyword}" (${domain || 'general'}) — researched across DuckDuckGo, Wikipedia, Reddit, Hacker News${brave ? ', Brave Web Search' : ''}${catLabel}\n`);
 
   if (stats.length) {
     p.push('VERIFIED STATISTICS (use these exact numbers with citations):');
@@ -1876,6 +1946,7 @@ function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryD
     hn_count: hn?.posts?.length || 0,
     wiki_found: !!wiki?.extract,
     brave_count: brave?.results?.length || 0,
+    ddg_count: ddg?.results?.length || 0,
     searched_at: now.toISOString(),
   };
 }
