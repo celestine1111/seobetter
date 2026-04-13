@@ -46,10 +46,19 @@ export default async function handler(req, res) {
     // Build topic candidates with scoring
     const topics = buildTopics(niche, suggest, datamuse, wiki, reddit);
 
+    // v1.5.22 — extract short keyword phrases for the Auto-suggest button
+    // in admin/views/content-generator.php. The button used to call
+    // /api/generate (LLM) with a strict-format prompt + fragile regex parser
+    // that frequently failed silently when Llama wrapped its output in
+    // markdown. Now Auto-suggest reads these arrays directly — real data
+    // from Google Suggest + Datamuse + Wikipedia, no LLM hallucination.
+    const keywords = buildKeywordSets(niche, suggest, datamuse, wiki);
+
     return res.status(200).json({
       success: true,
       niche,
       topics,
+      keywords,
       sources: {
         google_suggest: suggest.length,
         datamuse: datamuse.length,
@@ -167,6 +176,75 @@ async function fetchReddit(query) {
   } catch {
     return [];
   }
+}
+
+// ============================================================
+// v1.5.22 — Keyword set builder for the Auto-suggest button
+// ============================================================
+// Extracts short keyword phrases from the raw research arrays so the
+// Auto-suggest button in admin/views/content-generator.php can populate
+// the secondary_keywords + lsi_keywords fields directly. The LLM path
+// (/api/generate with strict-format prompt) was unreliable because Llama
+// wrapped output in markdown, breaking the client-side regex parser.
+function buildKeywordSets(niche, suggest, datamuse, wiki) {
+  const nicheLower = (niche || '').toLowerCase().trim();
+  const seen = new Set([ nicheLower ]);
+
+  // Secondary keywords — real Google Suggest variations of the niche.
+  // These are full phrases people actually search. 5-7 best fits.
+  const secondary = [];
+  for (const s of suggest) {
+    const phrase = (s || '').toLowerCase().trim();
+    if (!phrase || seen.has(phrase)) continue;
+    if (phrase.length < 6 || phrase.length > 80) continue;
+    // Must contain the niche or a piece of it (sanity filter)
+    const nicheParts = nicheLower.split(/\s+/).filter(w => w.length > 3);
+    const overlaps = nicheParts.some(w => phrase.includes(w));
+    if (!overlaps) continue;
+    seen.add(phrase);
+    secondary.push(phrase);
+    if (secondary.length >= 7) break;
+  }
+
+  // LSI keywords — semantic single-word terms from Datamuse.
+  // 8-10 best fits, deduplicated against secondary phrases.
+  const lsi = [];
+  const secondaryWords = new Set();
+  secondary.forEach(s => s.split(/\s+/).forEach(w => secondaryWords.add(w)));
+  for (const d of datamuse) {
+    const word = (d.word || '').toLowerCase().trim();
+    if (!word || word.length < 4 || word.length > 30) continue;
+    if (seen.has(word) || secondaryWords.has(word)) continue;
+    // Skip exact-match niche words
+    if (nicheLower.includes(word)) continue;
+    seen.add(word);
+    lsi.push(word);
+    if (lsi.length >= 10) break;
+  }
+
+  // If Datamuse returned too few results, top up with Wikipedia titles
+  // (single-word or 2-word) — these are always real concepts.
+  if (lsi.length < 6) {
+    for (const w of wiki) {
+      const title = (w.title || '').toLowerCase().trim();
+      if (!title) continue;
+      const wordCount = title.split(/\s+/).length;
+      if (wordCount > 2) continue;
+      if (seen.has(title)) continue;
+      if (nicheLower.includes(title) || title.includes(nicheLower)) continue;
+      seen.add(title);
+      lsi.push(title);
+      if (lsi.length >= 10) break;
+    }
+  }
+
+  return {
+    secondary,
+    lsi,
+    // Convenience: pre-joined comma-separated strings for the UI
+    secondary_string: secondary.join(', '),
+    lsi_string: lsi.join(', '),
+  };
 }
 
 // ============================================================
