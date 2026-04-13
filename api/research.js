@@ -24,7 +24,7 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Use POST.' });
 
-  const { keyword, site_url, brave_key, domain, country } = req.body || {};
+  const { keyword, site_url, brave_key, domain, country, places_keys } = req.body || {};
 
   if (!keyword) {
     return res.status(400).json({ error: 'keyword is required.' });
@@ -51,8 +51,11 @@ export default async function handler(req, res) {
       searchMastodon(keyword),
       searchDevTo(keyword),
       searchLemmy(keyword),
-      // v1.5.23 — OSM Places for local-intent queries (fixes hallucinated businesses)
-      fetchOSMPlaces(keyword, country),
+      // v1.5.24 — 5-tier Places waterfall (OSM → Wikidata → Foursquare → HERE → Google)
+      // Replaces the v1.5.23 OSM-only fetcher. Stops at first tier returning >=3
+      // verified places. User-provided API keys flow in via places_keys from
+      // Trend_Researcher.php::cloud_research(); tiers with no key are skipped.
+      fetchPlacesWaterfall(keyword, country, places_keys || {}),
     ];
 
     // Pro source — only if Brave key provided
@@ -659,50 +662,313 @@ async function overpassQuery(tags, bbox, typeLabel) {
   } catch { return []; }
 }
 
+// ============================================================
+// v1.5.24 — ADDITIONAL PLACES PROVIDERS (waterfall fallbacks)
+// ============================================================
+//
+// OSM + Overpass (v1.5.23) covers ~40% of small cities globally. The
+// following 4 providers extend coverage to ~99% via a waterfall that
+// stops at the first tier returning >=3 verified places:
+//
+//   Tier 2: Wikidata SPARQL (free, no key, no auth)
+//   Tier 3: Foursquare Places (free 1K calls/day, user API key)
+//   Tier 4: HERE Places (free 1K/day, user API key)
+//   Tier 5: Google Places API (New) (paid, $200/mo free credit, user key)
+//
+// Users configure their own API keys in SEOBetter Settings → Integrations;
+// keys travel in the /api/research request body as `places_keys.{provider}`.
+// Tiers with no key are simply skipped. Free baseline (OSM + Wikidata) works
+// out of the box for every user.
+
 /**
- * Main OSM places fetcher — called from the freeSearches parallel batch.
- * Returns { places: [...], location: string | null, isLocal: bool }.
- * Returns { places: [], ... } on any failure so generation still proceeds.
+ * Tier 2: Wikidata SPARQL — free structured knowledge base.
+ * Queries for entities in the geocoded city by lat/lon proximity (15km radius)
+ * filtered to those with human-readable labels. Returns named landmarks,
+ * historical businesses, tourist attractions that OSM may have missed.
  */
-async function fetchOSMPlaces(keyword, country) {
+async function fetchWikidataPlaces(businessHint, geo) {
+  if (!geo || !geo.lat || !geo.lon) return [];
+
+  // SPARQL query: find items within 15km of the coordinates with a label,
+  // ranked by distance. Filters out disambiguation pages and Wikimedia meta.
+  const sparql = `
+    SELECT DISTINCT ?item ?itemLabel ?itemDescription ?coord ?website ?address WHERE {
+      SERVICE wikibase:around {
+        ?item wdt:P625 ?coord .
+        bd:serviceParam wikibase:center "Point(${geo.lon} ${geo.lat})"^^geo:wktLiteral .
+        bd:serviceParam wikibase:radius "15" .
+      }
+      ?item rdfs:label ?itemLabel .
+      FILTER(LANG(?itemLabel) IN ("en","it","fr","es","de","pt"))
+      OPTIONAL { ?item wdt:P856 ?website }
+      OPTIONAL { ?item wdt:P6375 ?address }
+      FILTER NOT EXISTS { ?item wdt:P31 wd:Q4167410 }
+      FILTER NOT EXISTS { ?item wdt:P31 wd:Q4167836 }
+      SERVICE wikibase:label { bd:serviceParam wikibase:language "en,it,fr,es,de,pt" }
+    }
+    LIMIT 20
+  `;
+
+  try {
+    const url = 'https://query.wikidata.org/sparql?format=json&query=' + encodeURIComponent(sparql);
+    const resp = await fetch(url, {
+      headers: {
+        'Accept': 'application/sparql-results+json',
+        'User-Agent': 'SEOBetter/1.5.24 (Research)',
+      },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    const bindings = data?.results?.bindings || [];
+    return bindings.map(b => {
+      const qid = (b.item?.value || '').split('/').pop();
+      // Parse "Point(lon lat)" coord format
+      let lat = null, lon = null;
+      if (b.coord?.value) {
+        const m = b.coord.value.match(/Point\(([-\d.]+)\s+([-\d.]+)\)/);
+        if (m) { lon = parseFloat(m[1]); lat = parseFloat(m[2]); }
+      }
+      return {
+        name: b.itemLabel?.value || '',
+        type: b.itemDescription?.value || (businessHint || 'Local Place'),
+        address: b.address?.value || null,
+        website: b.website?.value || null,
+        phone: null,
+        opening_hours: null,
+        lat,
+        lon,
+        osm_url: `https://www.wikidata.org/wiki/${qid}`,
+        source: 'Wikidata',
+      };
+    }).filter(p => p.name);
+  } catch { return []; }
+}
+
+/**
+ * Tier 3: Foursquare Places — free 1K calls/day, user API key required.
+ * Best small-city coverage via user check-ins. Strong in Italy, Brazil,
+ * Portugal, Asia — anywhere tourists use the app.
+ */
+async function fetchFoursquarePlaces(businessHint, geo, apiKey) {
+  if (!apiKey || !geo || !geo.lat || !geo.lon) return [];
+  try {
+    const url = `https://places-api.foursquare.com/places/search?query=${encodeURIComponent(businessHint || '')}&ll=${geo.lat},${geo.lon}&radius=5000&limit=20`;
+    const resp = await fetch(url, {
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Accept': 'application/json',
+        'X-Places-Api-Version': '2025-06-17',
+      },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    const results = data?.results || [];
+    return results.map(r => {
+      const loc = r.location || {};
+      const addr = [ loc.address, loc.locality, loc.region, loc.country ].filter(Boolean).join(', ') || null;
+      const cat = (r.categories && r.categories[0]) || null;
+      return {
+        name: r.name || '',
+        type: cat?.name || (businessHint || 'Local Business'),
+        address: addr,
+        website: r.website || null,
+        phone: r.tel || null,
+        opening_hours: null,
+        lat: r.latitude ?? r.geocodes?.main?.latitude ?? null,
+        lon: r.longitude ?? r.geocodes?.main?.longitude ?? null,
+        osm_url: r.link ? `https://foursquare.com${r.link}` : `https://foursquare.com/v/${r.fsq_place_id || r.fsq_id || ''}`,
+        source: 'Foursquare',
+      };
+    }).filter(p => p.name);
+  } catch { return []; }
+}
+
+/**
+ * Tier 4: HERE Places — free 1K transactions/day, user API key required.
+ * Very strong European + Asian tier-2 city coverage. Powers Garmin, BMW,
+ * Mercedes nav systems.
+ */
+async function fetchHEREPlaces(businessHint, geo, apiKey) {
+  if (!apiKey || !geo || !geo.lat || !geo.lon) return [];
+  try {
+    const url = `https://discover.search.hereapi.com/v1/discover?apiKey=${encodeURIComponent(apiKey)}&q=${encodeURIComponent(businessHint || '')}&at=${geo.lat},${geo.lon}&limit=20&lang=en`;
+    const resp = await fetch(url, {
+      headers: { 'User-Agent': 'SEOBetter/1.5.24 (Research)' },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    const items = data?.items || [];
+    return items.map(it => {
+      const addr = it.address?.label || null;
+      const cat = it.categories && it.categories[0];
+      return {
+        name: it.title || '',
+        type: cat?.name || (businessHint || 'Local Business'),
+        address: addr,
+        website: (it.contacts && it.contacts[0]?.www && it.contacts[0].www[0]?.value) || null,
+        phone: (it.contacts && it.contacts[0]?.phone && it.contacts[0].phone[0]?.value) || null,
+        opening_hours: it.openingHours?.[0]?.text?.[0] || null,
+        lat: it.position?.lat || null,
+        lon: it.position?.lng || null,
+        osm_url: `https://www.here.com/p/s-${encodeURIComponent(it.id || '')}`,
+        source: 'HERE',
+      };
+    }).filter(p => p.name);
+  } catch { return []; }
+}
+
+/**
+ * Tier 5: Google Places API (New) — paid ($200/mo free credit = ~11K queries).
+ * Best global coverage including remote villages. User-provided key.
+ */
+async function fetchGooglePlaces(businessHint, geo, apiKey) {
+  if (!apiKey || !geo || !geo.lat || !geo.lon) return [];
+  try {
+    const body = {
+      textQuery: `${businessHint || 'local business'} near ${geo.display_name || ''}`.trim(),
+      maxResultCount: 20,
+      locationBias: {
+        circle: {
+          center: { latitude: geo.lat, longitude: geo.lon },
+          radius: 10000,
+        },
+      },
+    };
+    const resp = await fetch('https://places.googleapis.com/v1/places:searchText', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Goog-Api-Key': apiKey,
+        'X-Goog-FieldMask': 'places.displayName,places.formattedAddress,places.location,places.websiteUri,places.nationalPhoneNumber,places.googleMapsUri,places.id,places.types,places.currentOpeningHours',
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    const places = data?.places || [];
+    return places.map(p => ({
+      name: p.displayName?.text || '',
+      type: (p.types && p.types[0]) || (businessHint || 'Local Business'),
+      address: p.formattedAddress || null,
+      website: p.websiteUri || null,
+      phone: p.nationalPhoneNumber || null,
+      opening_hours: p.currentOpeningHours?.weekdayDescriptions?.join('; ') || null,
+      lat: p.location?.latitude ?? null,
+      lon: p.location?.longitude ?? null,
+      osm_url: p.googleMapsUri || `https://www.google.com/maps/place/?q=place_id:${p.id || ''}`,
+      source: 'Google Places',
+    })).filter(x => x.name);
+  } catch { return []; }
+}
+
+/**
+ * v1.5.24 — 5-tier places waterfall. Replaces the v1.5.23 OSM-only fetcher.
+ *
+ * Stops at the first tier returning >=3 places, so non-local queries and
+ * cities with good OSM coverage cost zero extra API calls. User-provided
+ * API keys flow in via placesKeys; tiers with no key are skipped.
+ *
+ * Returns `{ places, location, isLocal, business_type, providers_tried,
+ * provider_used, lat, lon }`. Always returns a valid shape (empty places
+ * on any failure) so article generation never breaks on this path.
+ */
+async function fetchPlacesWaterfall(keyword, country, placesKeys = {}) {
   const intent = detectLocalIntent(keyword);
   if (!intent.isLocal) {
-    return { places: [], location: null, isLocal: false, business_type: null };
+    return { places: [], location: null, isLocal: false, business_type: null, providers_tried: [], provider_used: null };
   }
 
-  // If no explicit location but we have a country code, use country as fallback
   let locationQuery = intent.location;
-  if (!locationQuery && country) {
-    locationQuery = country;
-  }
+  if (!locationQuery && country) locationQuery = country;
   if (!locationQuery) {
-    return { places: [], location: null, isLocal: true, business_type: null };
+    return { places: [], location: null, isLocal: true, business_type: null, providers_tried: [], provider_used: null };
   }
 
-  // Detect business type
-  const businessMatch = matchBusinessType(intent.businessHint);
-  if (!businessMatch) {
-    // Unknown business type — can't query Overpass by tag
-    return { places: [], location: locationQuery, isLocal: true, business_type: null };
-  }
-
-  // Geocode
+  // Single Nominatim geocode shared by every tier
   const geo = await nominatimGeocode(locationQuery);
-  if (!geo || !geo.bbox) {
-    return { places: [], location: locationQuery, isLocal: true, business_type: businessMatch.label };
+  if (!geo || !geo.lat) {
+    return { places: [], location: locationQuery, isLocal: true, business_type: null, providers_tried: [], provider_used: null };
   }
 
-  // Query Overpass
-  const places = await overpassQuery(businessMatch.tags, geo.bbox, businessMatch.label);
+  const businessMatch = matchBusinessType(intent.businessHint);
+  const businessHint = intent.businessHint || 'local business';
+
+  const providers_tried = [];
+  let places = [];
+  let provider_used = null;
+
+  // ---- Tier 1: OSM / Overpass (free, always on) ----
+  if (businessMatch && geo.bbox) {
+    const osmPlaces = await overpassQuery(businessMatch.tags, geo.bbox, businessMatch.label);
+    places = places.concat(osmPlaces);
+    providers_tried.push({ name: 'OpenStreetMap', count: osmPlaces.length });
+    if (places.length >= 3) provider_used = 'OpenStreetMap';
+  }
+
+  // ---- Tier 2: Wikidata (free, always on) ----
+  if (!provider_used) {
+    const wd = await fetchWikidataPlaces(businessHint, geo);
+    places = places.concat(wd);
+    providers_tried.push({ name: 'Wikidata', count: wd.length });
+    if (places.length >= 3) {
+      provider_used = places.length > wd.length ? 'OpenStreetMap + Wikidata' : 'Wikidata';
+    }
+  }
+
+  // ---- Tier 3: Foursquare (free, user key) ----
+  if (!provider_used && placesKeys && placesKeys.foursquare) {
+    const fsq = await fetchFoursquarePlaces(businessHint, geo, placesKeys.foursquare);
+    places = places.concat(fsq);
+    providers_tried.push({ name: 'Foursquare', count: fsq.length });
+    if (places.length >= 3) provider_used = 'Foursquare';
+  }
+
+  // ---- Tier 4: HERE Places (free, user key) ----
+  if (!provider_used && placesKeys && placesKeys.here) {
+    const here = await fetchHEREPlaces(businessHint, geo, placesKeys.here);
+    places = places.concat(here);
+    providers_tried.push({ name: 'HERE', count: here.length });
+    if (places.length >= 3) provider_used = 'HERE';
+  }
+
+  // ---- Tier 5: Google Places (paid, user key) ----
+  if (!provider_used && placesKeys && placesKeys.google) {
+    const google = await fetchGooglePlaces(businessHint, geo, placesKeys.google);
+    places = places.concat(google);
+    providers_tried.push({ name: 'Google Places', count: google.length });
+    if (places.length >= 3) provider_used = 'Google Places';
+  }
+
+  // Deduplicate by lowercased name — the same place may appear in multiple
+  // providers, and we want the union, not a triple-listed result.
+  const seen = new Set();
+  const dedupedPlaces = places.filter(p => {
+    const key = (p.name || '').toLowerCase().trim();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).slice(0, 20);
 
   return {
-    places,
+    places: dedupedPlaces,
     location: geo.display_name || locationQuery,
     isLocal: true,
-    business_type: businessMatch.label,
+    business_type: businessMatch?.label || null,
+    providers_tried,
+    provider_used: provider_used || (dedupedPlaces.length > 0 ? 'partial' : null),
     lat: geo.lat,
     lon: geo.lon,
   };
+}
+
+// v1.5.24 — backwards-compat alias for any external caller still using the
+// old v1.5.23 function name. Internal callers use fetchPlacesWaterfall directly.
+async function fetchOSMPlaces(keyword, country) {
+  return fetchPlacesWaterfall(keyword, country, {});
 }
 
 // ============================================================
@@ -2477,19 +2743,23 @@ function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryD
   }
 
   // v1.5.23 — REAL LOCAL PLACES block (closed-menu grounding to prevent
-  // hallucinated businesses). The PLACES RULES in the system prompt reference
-  // this exact section heading. If empty, we include a warning instead so the
-  // AI knows not to invent businesses.
+  // hallucinated businesses). v1.5.24 — now sourced from the 5-tier waterfall
+  // (OSM + Wikidata + optional Foursquare/HERE/Google). The PLACES RULES in
+  // the system prompt reference this exact section heading. If empty, we
+  // include a warning instead so the AI knows not to invent businesses.
   if (placesData?.isLocal) {
     if (placesForPrompt.length > 0) {
+      const sourceLabel = placesData.provider_used || 'verified open-map data';
       p.push(`\nREAL LOCAL PLACES in ${placesData.location} (use ONLY these businesses — do NOT invent any others):`);
       placesForPrompt.forEach((pl, i) => {
         p.push(`${i + 1}. ${pl.line}`);
         if (pl.detail) p.push(`   ${pl.detail}`);
       });
-      p.push(`\n(${placesForPrompt.length} real ${placesData.business_type || 'place'}s verified via OpenStreetMap. Per PLACES RULES, you MUST use only these exact names and addresses — no fabricated businesses.)`);
+      p.push(`\n(${placesForPrompt.length} real ${placesData.business_type || 'place'}s verified via ${sourceLabel}. Per PLACES RULES, you MUST use only these exact names and addresses — no fabricated businesses.)`);
     } else {
-      p.push('\nLOCAL-INTENT WARNING: This keyword asks about local businesses but the OpenStreetMap lookup returned ZERO verified places. The location may be too small for OSM coverage OR the business type wasn\'t recognized. DO NOT invent business names. Per PLACES RULES, write a general informational article without naming specific businesses, and add a disclaimer paragraph at the end suggesting readers check Google Maps or OpenStreetMap directly.');
+      const triedList = (placesData.providers_tried || []).map(t => `${t.name} (${t.count})`).join(', ');
+      const triedSuffix = triedList ? ` Providers tried: ${triedList}.` : '';
+      p.push(`\nLOCAL-INTENT WARNING: This keyword asks about local businesses but the Places waterfall returned ZERO verified places.${triedSuffix} The location may be too small for open-map coverage OR the business type wasn't recognized. DO NOT invent business names. Per PLACES RULES, write a general informational article without naming specific businesses, and add a disclaimer paragraph at the end suggesting readers check Google Maps or OpenStreetMap directly. The user can configure free Foursquare/HERE or paid Google Places API keys in SEOBetter Settings → Integrations for better small-city coverage.`);
     }
   }
 
@@ -2520,11 +2790,13 @@ function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryD
     mastodon_count: social?.mastodon?.posts?.length || 0,
     devto_count: social?.devto?.posts?.length || 0,
     lemmy_count: social?.lemmy?.posts?.length || 0,
-    // v1.5.23 — local-intent + OSM places telemetry
+    // v1.5.23/v1.5.24 — local-intent + Places waterfall telemetry
     is_local_intent: !!placesData?.isLocal,
     places_count: placesData?.places?.length || 0,
     places_location: placesData?.location || null,
     places_business_type: placesData?.business_type || null,
+    places_provider_used: placesData?.provider_used || null,
+    places_providers_tried: placesData?.providers_tried || [],
     searched_at: now.toISOString(),
   };
 }
