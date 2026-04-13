@@ -46,6 +46,11 @@ export default async function handler(req, res) {
       searchWikipedia(keyword),
       searchGoogleTrends(keyword),
       searchDuckDuckGo(keyword),
+      // v1.5.16 — additional free social/discussion sources
+      searchBluesky(keyword),
+      searchMastodon(keyword),
+      searchDevTo(keyword),
+      searchLemmy(keyword),
     ];
 
     // Pro source — only if Brave key provided
@@ -65,8 +70,10 @@ export default async function handler(req, res) {
       Promise.all(catPromises),
     ]);
 
-    const [redditData, hnData, wikiData, trendsData, ddgData, ...extraCore] = coreResults;
+    const [redditData, hnData, wikiData, trendsData, ddgData, blueskyData, mastodonData, devtoData, lemmyData, ...extraCore] = coreResults;
     const braveData = brave_key ? extraCore[0] : null;
+    // v1.5.16 — package the 4 new social fetchers into one object passed to buildResearchResult
+    const socialData = { bluesky: blueskyData, mastodon: mastodonData, devto: devtoData, lemmy: lemmyData };
 
     // Pair category + country results with their metadata
     const categoryData = allCatEntries.map((e, i) => ({
@@ -75,7 +82,7 @@ export default async function handler(req, res) {
       data: catResults[i],
     }));
 
-    const result = buildResearchResult(keyword, redditData, hnData, wikiData, trendsData, braveData, categoryData, domain, ddgData);
+    const result = buildResearchResult(keyword, redditData, hnData, wikiData, trendsData, braveData, categoryData, domain, ddgData, socialData);
 
     return res.status(200).json(result);
   } catch (err) {
@@ -132,6 +139,138 @@ async function searchHackerNews(keyword) {
         hn_url: `https://news.ycombinator.com/item?id=${h.objectID}`,
         created: h.created_at?.split('T')[0] || '',
       })),
+    };
+  } catch { return { posts: [] }; }
+}
+
+// ============================================================
+// SOCIAL DISCUSSION SOURCES (v1.5.16) — free, no auth, always-on
+// These give the prompt "what people are saying RIGHT NOW" signals which
+// matter for AI citations. X/Twitter has no clean free API in 2026 — see
+// pro-features-ideas.md "X / Twitter integration" item for the cookie-auth
+// research path planned for a future release.
+// ============================================================
+
+/**
+ * Search Bluesky public posts (free, no auth).
+ * Captures part of the post-X tech audience. Public AT Protocol API.
+ */
+async function searchBluesky(keyword) {
+  const url = `https://api.bsky.app/xrpc/app.bsky.feed.searchPosts?q=${encodeURIComponent(keyword)}&limit=8`;
+  try {
+    const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    if (!resp.ok) return { posts: [] };
+    const data = await resp.json();
+    return {
+      posts: (data?.posts || []).map(p => ({
+        title: (p.record?.text || '').substring(0, 120),
+        text: (p.record?.text || '').substring(0, 280),
+        author: p.author?.handle || 'unknown',
+        author_name: p.author?.displayName || p.author?.handle || 'unknown',
+        likes: p.likeCount || 0,
+        reposts: p.repostCount || 0,
+        replies: p.replyCount || 0,
+        url: `https://bsky.app/profile/${p.author?.handle}/post/${(p.uri || '').split('/').pop()}`,
+        created: p.indexedAt?.split('T')[0] || '',
+      })).slice(0, 8),
+    };
+  } catch { return { posts: [] }; }
+}
+
+/**
+ * Search Mastodon public statuses via mastodon.social (largest instance).
+ * Federated content from the wider Fediverse. Public timeline only — no auth.
+ */
+async function searchMastodon(keyword) {
+  const url = `https://mastodon.social/api/v2/search?q=${encodeURIComponent(keyword)}&type=statuses&limit=8`;
+  try {
+    const resp = await fetch(url, {
+      headers: { 'User-Agent': 'SEOBetter/1.5.16 (Research)' },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!resp.ok) return { posts: [] };
+    const data = await resp.json();
+    return {
+      posts: (data?.statuses || []).map(s => {
+        const plain = (s.content || '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+        return {
+          title: plain.substring(0, 120),
+          text: plain.substring(0, 280),
+          author: s.account?.acct || 'unknown',
+          author_name: s.account?.display_name || s.account?.username || 'unknown',
+          favourites: s.favourites_count || 0,
+          reblogs: s.reblogs_count || 0,
+          replies: s.replies_count || 0,
+          url: s.url || s.uri,
+          created: s.created_at?.split('T')[0] || '',
+        };
+      }).slice(0, 8),
+    };
+  } catch { return { posts: [] }; }
+}
+
+/**
+ * Search DEV.to articles (free, no auth, public REST API).
+ * Excellent signal for tech/dev/skill topics — articles have engagement
+ * metrics (reactions, comments) and are written by practitioners.
+ */
+async function searchDevTo(keyword) {
+  // DEV.to search supports both query and tag filters; try query first
+  const url = `https://dev.to/api/articles?per_page=8&top=30&search=${encodeURIComponent(keyword)}`;
+  try {
+    const resp = await fetch(url, {
+      headers: { 'User-Agent': 'SEOBetter/1.5.16 (Research)', 'Accept': 'application/json' },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!resp.ok) return { posts: [] };
+    const data = await resp.json();
+    if (!Array.isArray(data)) return { posts: [] };
+    return {
+      posts: data.map(a => ({
+        title: a.title || '',
+        description: (a.description || '').substring(0, 280),
+        author: a.user?.username || 'unknown',
+        author_name: a.user?.name || a.user?.username || 'unknown',
+        reactions: a.public_reactions_count || 0,
+        comments: a.comments_count || 0,
+        reading_time: a.reading_time_minutes || 0,
+        url: a.url || a.canonical_url || '',
+        created: a.published_at?.split('T')[0] || '',
+        tags: Array.isArray(a.tag_list) ? a.tag_list.slice(0, 5) : [],
+      })).slice(0, 8),
+    };
+  } catch { return { posts: [] }; }
+}
+
+/**
+ * Search Lemmy (federated Reddit alternative) via lemmy.world instance.
+ * Smaller audience than Reddit but technically vocal — captures content
+ * that Reddit-haters post elsewhere. Free, no auth.
+ */
+async function searchLemmy(keyword) {
+  const url = `https://lemmy.world/api/v3/search?q=${encodeURIComponent(keyword)}&type_=Posts&sort=TopMonth&limit=8`;
+  try {
+    const resp = await fetch(url, {
+      headers: { 'User-Agent': 'SEOBetter/1.5.16 (Research)', 'Accept': 'application/json' },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!resp.ok) return { posts: [] };
+    const data = await resp.json();
+    return {
+      posts: (data?.posts || []).map(item => {
+        const p = item.post || item;
+        const counts = item.counts || {};
+        const community = item.community || {};
+        return {
+          title: p.name || '',
+          text: (p.body || '').substring(0, 280),
+          community: community.name || '',
+          score: counts.score || 0,
+          comments: counts.comments || 0,
+          url: p.ap_id || p.url || `https://lemmy.world/post/${p.id}`,
+          created: p.published?.split('T')[0] || '',
+        };
+      }).slice(0, 8),
     };
   } catch { return { posts: [] }; }
 }
@@ -1802,7 +1941,7 @@ function fetchSpaceflightNews(keyword) {
 // BUILD RESULT
 // ============================================================
 
-function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryData, domain, ddg) {
+function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryData, domain, ddg, social) {
   const now = new Date();
   const monthYear = now.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
   const year = now.getFullYear();
@@ -1879,6 +2018,60 @@ function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryD
         });
       }
       trending.push(`"${p.title}" — ${p.points} points on Hacker News`);
+    });
+  }
+
+  // ---- v1.5.16 — Social discussion sources (Bluesky, Mastodon, DEV.to, Lemmy) ----
+  // Each contributes to trending[] (freshness signal in prompt) and sources[] (references).
+  if (social?.bluesky?.posts?.length) {
+    social.bluesky.posts.slice(0, 3).forEach(p => {
+      if (p.text) {
+        trending.push(`"${p.text.substring(0, 120)}" — @${p.author} on Bluesky (${p.likes} likes, ${p.replies} replies)`);
+      }
+      // Bluesky post URLs are stable and citable
+      if (p.url && p.text && p.text.length > 30) {
+        sources.push({ url: p.url, title: p.text.substring(0, 80), source_name: `Bluesky @${p.author}` });
+      }
+    });
+  }
+
+  if (social?.mastodon?.posts?.length) {
+    social.mastodon.posts.slice(0, 3).forEach(p => {
+      if (p.text) {
+        trending.push(`"${p.text.substring(0, 120)}" — @${p.author} on Mastodon (${p.favourites} favs, ${p.replies} replies)`);
+      }
+      if (p.url && p.text && p.text.length > 30) {
+        sources.push({ url: p.url, title: p.text.substring(0, 80), source_name: `Mastodon @${p.author}` });
+      }
+    });
+  }
+
+  if (social?.devto?.posts?.length) {
+    social.devto.posts.slice(0, 4).forEach(a => {
+      if (a.title) {
+        trending.push(`"${a.title}" — DEV.to article by @${a.author} (${a.reactions} reactions, ${a.comments} comments)`);
+      }
+      if (a.url && a.title) {
+        sources.push({ url: a.url, title: a.title, source_name: `DEV.to @${a.author}` });
+      }
+      // DEV.to descriptions often contain real numbers worth surfacing
+      if (a.description) {
+        const numbers = a.description.match(/\d[\d,\.]+\s*(?:billion|million|thousand|percent|%|\$|users|developers)/gi);
+        if (numbers) {
+          numbers.slice(0, 1).forEach(n => stats.push(`${n} — ${a.title} (DEV.to, ${year})`));
+        }
+      }
+    });
+  }
+
+  if (social?.lemmy?.posts?.length) {
+    social.lemmy.posts.slice(0, 3).forEach(p => {
+      if (p.title) {
+        trending.push(`"${p.title}" — ${p.score} score in Lemmy c/${p.community}`);
+      }
+      if (p.url && p.title) {
+        sources.push({ url: p.url, title: p.title, source_name: `Lemmy c/${p.community}` });
+      }
     });
   }
 
@@ -1966,7 +2159,14 @@ function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryD
   const catNames = (categoryData || []).filter(c => c.data?.stats?.length).map(c => c.name);
   const catLabel = catNames.length ? `, ${catNames.join(', ')}` : '';
   p.push(`REAL-TIME RESEARCH DATA (${monthYear}):`);
-  p.push(`Topic: "${keyword}" (${domain || 'general'}) — researched across DuckDuckGo, Wikipedia, Reddit, Hacker News${brave ? ', Brave Web Search' : ''}${catLabel}\n`);
+  // v1.5.16 — list any of the new social sources that returned data
+  const socialNames = [];
+  if (social?.bluesky?.posts?.length) socialNames.push('Bluesky');
+  if (social?.mastodon?.posts?.length) socialNames.push('Mastodon');
+  if (social?.devto?.posts?.length) socialNames.push('DEV.to');
+  if (social?.lemmy?.posts?.length) socialNames.push('Lemmy');
+  const socialLabel = socialNames.length ? ', ' + socialNames.join(', ') : '';
+  p.push(`Topic: "${keyword}" (${domain || 'general'}) — researched across DuckDuckGo, Wikipedia, Reddit, Hacker News${socialLabel}${brave ? ', Brave Web Search' : ''}${catLabel}\n`);
 
   if (stats.length) {
     p.push('VERIFIED STATISTICS (use these exact numbers with citations):');
@@ -1996,7 +2196,7 @@ function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryD
     stats: stats.slice(0, 20),
     quotes: quotes.slice(0, 5),
     sources: uniqueSources.slice(0, 25),
-    trends: trending.slice(0, 8),
+    trends: trending.slice(0, 12),
     for_prompt: p.join('\n'),
     domain: domain || 'general',
     category_apis: (categoryData || []).filter(c => c.data?.stats?.length).map(c => c.name),
@@ -2005,6 +2205,11 @@ function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryD
     wiki_found: !!wiki?.extract,
     brave_count: brave?.results?.length || 0,
     ddg_count: ddg?.results?.length || 0,
+    // v1.5.16 — counts for the new social fetchers
+    bluesky_count: social?.bluesky?.posts?.length || 0,
+    mastodon_count: social?.mastodon?.posts?.length || 0,
+    devto_count: social?.devto?.posts?.length || 0,
+    lemmy_count: social?.lemmy?.posts?.length || 0,
     searched_at: now.toISOString(),
   };
 }
