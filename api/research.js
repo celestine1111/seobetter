@@ -323,11 +323,16 @@ async function searchDuckDuckGo(keyword) {
  * Each call has a 6s timeout so it never blocks the response.
  */
 function getCategorySearches(domain, keyword) {
+  // v1.5.15 — domain category map. Keep this in sync with the dropdowns in
+  // admin/views/content-generator.php, bulk-generator.php, content-brief.php.
+  // If you add a category here, add it to all 3 forms and BUILD_LOG.md.
   const map = {
     finance:        [() => fetchEcondb(keyword), () => fetchFedTreasury(), () => fetchSECEdgar(keyword), () => fetchWorldBank(keyword)],
     cryptocurrency: [() => fetchCoinGecko(keyword), () => fetchCoinCap(keyword), () => fetchCoinDesk(), () => fetchCoinpaprika(), () => fetchCoinlore(), () => fetchCryptoCompare(keyword), () => fetchMempool()],
     currency:       [() => fetchFrankfurter(), () => fetchCurrencyApi(), () => fetchWorldBank(keyword)],
     health:         [() => fetchOpenDisease(keyword), () => fetchOpenFDA(keyword)],
+    // v1.5.15 — NEW: real veterinary research APIs (peer-reviewed, free, no auth)
+    veterinary:     [() => fetchCrossrefFiltered(keyword, 'veterinary'), () => fetchEuropePMC(keyword + ' veterinary'), () => fetchOpenAlex(keyword, 'veterinary'), () => fetchOpenFDA(keyword + ' veterinary'), () => fetchDogFacts()],
     science:        [() => fetchNASA(), () => fetchUSGSEarthquakes(), () => fetchLaunchLibrary(), () => fetchSpaceX(), () => fetchUSGSWater(), () => fetchSunriseSunset(), () => fetchNumberFacts(keyword), () => fetchCrossref(keyword)],
     weather:        [() => fetchOpenMeteo(keyword), () => fetchUSWeather(), () => fetchSunriseSunset(), () => fetchOpenAQ()],
     animals:        [() => fetchFishWatch(keyword), () => fetchZooAnimals(keyword), () => fetchDogFacts(), () => fetchCatFacts(), () => fetchMeowFacts()],
@@ -335,6 +340,8 @@ function getCategorySearches(domain, keyword) {
     environment:    [() => fetchOpenAQ(), () => fetchUKCarbon(), () => fetchCO2Offset(), () => fetchUSGSWater()],
     food:           [() => fetchOpenFoodFacts(keyword), () => fetchFruityvice(keyword), () => fetchOpenBreweryDB(keyword)],
     books:          [() => fetchOpenLibrary(keyword), () => fetchPoetryDB(keyword), () => fetchCrossref(keyword), () => fetchQuotable(keyword)],
+    // v1.5.15 — merged government + law_government (was duplicated). law_government still
+    // accepted as alias below for backwards compat with older clients.
     government:     [() => fetchDataUSA(keyword), () => fetchFBIWanted(), () => fetchInterpolRedNotices(), () => fetchFederalRegister(), () => fetchNagerDate()],
     entertainment:  [() => fetchOpenTrivia(), () => fetchOMDb(keyword), () => fetchSWAPI(), () => fetchPokeApi(keyword), () => fetchQuotable(keyword)],
     music:          [() => fetchMusicBrainz(keyword), () => fetchBandsintown(keyword)],
@@ -346,12 +353,13 @@ function getCategorySearches(domain, keyword) {
     transportation: [() => fetchOpenSky(), () => fetchOpenChargeMap(keyword), () => fetchADSBExchange(), () => fetchCityBikes(), () => fetchNHTSA(keyword)],
     news:           [() => fetchSpaceflightNews(keyword), () => fetchHackerNewsTop(), () => fetchFederalRegister()],
     ecommerce:      [() => fetchOpenFoodFacts(keyword)],
-    law_government: [() => fetchFBIWanted(), () => fetchDataUSA(keyword), () => fetchInterpolRedNotices(), () => fetchFederalRegister(), () => fetchNagerDate()],
     business:       [() => fetchEcondb(keyword), () => fetchWorldBank(keyword), () => fetchFedTreasury()],
     general:        [() => fetchQuotable(keyword), () => fetchNagerDate(), () => fetchNumberFacts(keyword)],
   };
 
-  const fns = map[domain] || [];
+  // v1.5.15 — backwards-compat alias for the old law_government domain value
+  const resolved = (domain === 'law_government') ? 'government' : domain;
+  const fns = map[resolved] || [];
   return fns.map(fn => {
     const result = fn();
     return { name: result.name, source: result.source, promise: result.promise };
@@ -1682,6 +1690,56 @@ function fetchCrossref(keyword) {
       text: `"${w.title?.[0] || ''}" — ${w.author?.[0]?.family || 'Unknown'} et al. (${w.published?.['date-parts']?.[0]?.[0] || ''}) cited ${w['is-referenced-by-count'] || 0} times (Crossref, ${new Date().getFullYear()})`,
       url: w.URL || `https://doi.org/${w.DOI}`,
       source: 'Crossref',
+    }))};
+  })() };
+}
+
+// ---- VETERINARY / BIOMEDICAL RESEARCH (v1.5.15) ----
+// Crossref filtered by bibliographic subject — narrows results to a topic area
+// like "veterinary" so dog/cat/equine articles get vet-relevant peer-reviewed papers
+// instead of generic top-cited works.
+function fetchCrossrefFiltered(keyword, subject) {
+  const subjectLabel = subject || 'general';
+  return { name: `Crossref (${subjectLabel})`, source: 'Crossref', promise: (async () => {
+    const url = `https://api.crossref.org/works?query=${encodeURIComponent(keyword)}&query.bibliographic=${encodeURIComponent(subject)}&filter=type:journal-article&rows=3`;
+    const data = await safeFetch(url);
+    if (!data?.message?.items?.length) return { stats: [] };
+    return { stats: data.message.items.map(w => ({
+      text: `"${w.title?.[0] || ''}" — ${w.author?.[0]?.family || 'Unknown'} et al. (${w.published?.['date-parts']?.[0]?.[0] || ''}) cited ${w['is-referenced-by-count'] || 0} times (Crossref ${subjectLabel}, ${new Date().getFullYear()})`,
+      url: w.URL || `https://doi.org/${w.DOI}`,
+      source: `Crossref (${subjectLabel})`,
+    }))};
+  })() };
+}
+
+// EuropePMC — biomedical and life-sciences literature (free, no auth, generous rate limit)
+// Best for clinical/veterinary research that may not be in Crossref. Returns up to 3 results.
+function fetchEuropePMC(query) {
+  return { name: 'EuropePMC', source: 'EuropePMC', promise: (async () => {
+    const url = `https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=${encodeURIComponent(query)}&format=json&pageSize=3&resultType=lite`;
+    const data = await safeFetch(url);
+    const results = data?.resultList?.result;
+    if (!results?.length) return { stats: [] };
+    return { stats: results.map(r => ({
+      text: `"${r.title || ''}" — ${r.authorString || 'Unknown'} (${r.journalTitle || r.bookOrReportDetails?.publisher || 'Journal'}, ${r.pubYear || ''}) cited ${r.citedByCount || 0} times (EuropePMC, ${new Date().getFullYear()})`,
+      url: r.doi ? `https://doi.org/${r.doi}` : (r.pmid ? `https://europepmc.org/article/MED/${r.pmid}` : `https://europepmc.org/article/${r.source}/${r.id}`),
+      source: 'EuropePMC',
+    }))};
+  })() };
+}
+
+// OpenAlex — 240M+ scholarly works with topic concept filtering (free, no auth).
+// Filtering by display_name surfaces papers tagged with the concept (e.g. "veterinary").
+function fetchOpenAlex(keyword, conceptName) {
+  return { name: `OpenAlex (${conceptName || 'all'})`, source: 'OpenAlex', promise: (async () => {
+    const filterParam = conceptName ? `&filter=concepts.display_name.search:${encodeURIComponent(conceptName)}` : '';
+    const url = `https://api.openalex.org/works?search=${encodeURIComponent(keyword)}${filterParam}&per_page=3&mailto=research@seobetter.com`;
+    const data = await safeFetch(url);
+    if (!data?.results?.length) return { stats: [] };
+    return { stats: data.results.map(w => ({
+      text: `"${w.title || w.display_name || ''}" — ${w.authorships?.[0]?.author?.display_name || 'Unknown'} et al. (${w.publication_year || ''}) cited ${w.cited_by_count || 0} times (OpenAlex, ${new Date().getFullYear()})`,
+      url: w.doi ? (w.doi.startsWith('http') ? w.doi : `https://doi.org/${w.doi.replace(/^doi:/, '')}`) : (w.id || 'https://openalex.org/'),
+      source: 'OpenAlex',
     }))};
   })() };
 }
