@@ -51,6 +51,8 @@ export default async function handler(req, res) {
       searchMastodon(keyword),
       searchDevTo(keyword),
       searchLemmy(keyword),
+      // v1.5.23 — OSM Places for local-intent queries (fixes hallucinated businesses)
+      fetchOSMPlaces(keyword, country),
     ];
 
     // Pro source — only if Brave key provided
@@ -70,7 +72,7 @@ export default async function handler(req, res) {
       Promise.all(catPromises),
     ]);
 
-    const [redditData, hnData, wikiData, trendsData, ddgData, blueskyData, mastodonData, devtoData, lemmyData, ...extraCore] = coreResults;
+    const [redditData, hnData, wikiData, trendsData, ddgData, blueskyData, mastodonData, devtoData, lemmyData, placesData, ...extraCore] = coreResults;
     const braveData = brave_key ? extraCore[0] : null;
     // v1.5.16 — package the 4 new social fetchers into one object passed to buildResearchResult
     const socialData = { bluesky: blueskyData, mastodon: mastodonData, devto: devtoData, lemmy: lemmyData };
@@ -82,7 +84,7 @@ export default async function handler(req, res) {
       data: catResults[i],
     }));
 
-    const result = buildResearchResult(keyword, redditData, hnData, wikiData, trendsData, braveData, categoryData, domain, ddgData, socialData);
+    const result = buildResearchResult(keyword, redditData, hnData, wikiData, trendsData, braveData, categoryData, domain, ddgData, socialData, placesData);
 
     return res.status(200).json(result);
   } catch (err) {
@@ -450,6 +452,257 @@ async function searchDuckDuckGo(keyword) {
 
     return { results };
   } catch { return { results: [] }; }
+}
+
+// ============================================================
+// OSM PLACES (v1.5.23) — Nominatim geocode + Overpass POI lookup
+// ============================================================
+//
+// Fixes the "fake Italian gelato shops" hallucination bug. Before v1.5.23
+// the research pipeline had ZERO place/business data sources, so when the
+// user asked for "Whats The Best Gelato Shops In Lucignano Italy" the LLM
+// invented plausible-sounding business names that don't exist on the ground.
+//
+// Fix: detect local-intent keywords via regex, extract the location and
+// business type, geocode via OpenStreetMap Nominatim (free, no key, no
+// auth), then query Overpass API for real POIs in the bounding box. The
+// resulting places feed the Citation Pool and a dedicated "REAL LOCAL
+// PLACES" section in the AI prompt that the model MUST use as a closed menu.
+//
+// Both APIs are fully free and global. Nominatim rate-limits at 1 req/sec
+// and requires a User-Agent header per ToS. Overpass has no strict rate
+// limit but we use a 20-sec server-side timeout to prevent runaway queries.
+
+/**
+ * Keyword → OSM tag map for business-type detection.
+ * Keys are the substring we search for in the keyword (lowercased).
+ * Values are the OSM tag pairs to query Overpass with.
+ */
+const OSM_TYPE_MAP = [
+  [ 'gelato',        { amenity: 'ice_cream' },    'Ice Cream Shop' ],
+  [ 'ice cream',     { amenity: 'ice_cream' },    'Ice Cream Shop' ],
+  [ 'pizza',         { amenity: 'restaurant', cuisine: 'pizza' }, 'Pizza Restaurant' ],
+  [ 'restaurant',    { amenity: 'restaurant' },   'Restaurant' ],
+  [ 'cafe',          { amenity: 'cafe' },         'Café' ],
+  [ 'coffee shop',   { amenity: 'cafe' },         'Coffee Shop' ],
+  [ 'coffee',        { amenity: 'cafe' },         'Café' ],
+  [ 'bar',           { amenity: 'bar' },          'Bar' ],
+  [ 'pub',           { amenity: 'pub' },          'Pub' ],
+  [ 'hotel',         { tourism: 'hotel' },        'Hotel' ],
+  [ 'hostel',        { tourism: 'hostel' },       'Hostel' ],
+  [ 'bakery',        { shop: 'bakery' },          'Bakery' ],
+  [ 'butcher',       { shop: 'butcher' },         'Butcher' ],
+  [ 'bookshop',      { shop: 'books' },           'Bookshop' ],
+  [ 'bookstore',     { shop: 'books' },           'Bookstore' ],
+  [ 'pet shop',      { shop: 'pet' },             'Pet Shop' ],
+  [ 'pet store',     { shop: 'pet' },             'Pet Store' ],
+  [ 'vet',           { amenity: 'veterinary' },   'Veterinary Clinic' ],
+  [ 'veterinarian',  { amenity: 'veterinary' },   'Veterinary Clinic' ],
+  [ 'groomer',       { shop: 'pet_grooming' },    'Pet Groomer' ],
+  [ 'dentist',       { amenity: 'dentist' },      'Dentist' ],
+  [ 'doctor',        { amenity: 'doctors' },      'Doctor' ],
+  [ 'pharmacy',      { amenity: 'pharmacy' },     'Pharmacy' ],
+  [ 'hospital',      { amenity: 'hospital' },     'Hospital' ],
+  [ 'gym',           { leisure: 'fitness_centre' }, 'Gym' ],
+  [ 'fitness',       { leisure: 'fitness_centre' }, 'Fitness Centre' ],
+  [ 'museum',        { tourism: 'museum' },       'Museum' ],
+  [ 'park',          { leisure: 'park' },         'Park' ],
+  [ 'beach',         { natural: 'beach' },        'Beach' ],
+  [ 'school',        { amenity: 'school' },       'School' ],
+  [ 'library',       { amenity: 'library' },      'Library' ],
+  [ 'supermarket',   { shop: 'supermarket' },     'Supermarket' ],
+  [ 'florist',       { shop: 'florist' },         'Florist' ],
+  [ 'clothing',      { shop: 'clothes' },         'Clothing Store' ],
+  [ 'barber',        { shop: 'hairdresser' },     'Barber / Hairdresser' ],
+  [ 'hairdresser',   { shop: 'hairdresser' },     'Hairdresser' ],
+  [ 'nails',         { shop: 'beauty' },          'Beauty / Nails' ],
+  [ 'spa',           { leisure: 'spa' },          'Spa' ],
+  [ 'car wash',      { amenity: 'car_wash' },     'Car Wash' ],
+  [ 'mechanic',      { shop: 'car_repair' },      'Car Repair' ],
+  [ 'gas station',   { amenity: 'fuel' },         'Gas Station' ],
+  [ 'petrol',        { amenity: 'fuel' },         'Petrol Station' ],
+];
+
+/**
+ * Detect local intent in a keyword.
+ * Returns { isLocal: bool, location: string | null, businessHint: string }
+ */
+function detectLocalIntent(keyword) {
+  if (!keyword || typeof keyword !== 'string') return { isLocal: false, location: null, businessHint: '' };
+  const kw = keyword.trim();
+
+  // Pattern 1: "X in Y" or "X in Y Country" (e.g. "gelato shops in Lucignano Italy")
+  let m = kw.match(/^(.+?)\s+in\s+([A-Z][\w\s,'-]+?)(?:\s+(\d{4}))?$/i);
+  if (m) {
+    return { isLocal: true, location: m[2].trim(), businessHint: m[1].trim() };
+  }
+
+  // Pattern 2: "best X in Y" / "top X near Y" (year suffix optional)
+  m = kw.match(/^(?:best|top|greatest|finest)\s+(.+?)\s+(?:in|near|around)\s+([A-Z][\w\s,'-]+?)(?:\s+(\d{4}))?$/i);
+  if (m) {
+    return { isLocal: true, location: m[2].trim(), businessHint: m[1].trim() };
+  }
+
+  // Pattern 3: "X near me" / "X nearby" / "local X"
+  if (/\b(?:near\s*me|nearby|local)\b/i.test(kw)) {
+    // No explicit location — caller needs to resolve via IP or fall back
+    const businessHint = kw.replace(/\b(?:near\s*me|nearby|local|best|top)\b/gi, '').trim();
+    return { isLocal: true, location: null, businessHint };
+  }
+
+  // Pattern 4: "what's the best X in Y" (handles the user's tested keyword form)
+  m = kw.match(/^(?:what'?s?|which|where)\s+(?:is|are)?\s*(?:the\s+)?(?:best|top)\s+(.+?)\s+(?:in|near|around|at)\s+([A-Z][\w\s,'-]+?)(?:\s+(\d{4}))?$/i);
+  if (m) {
+    return { isLocal: true, location: m[2].trim(), businessHint: m[1].trim() };
+  }
+
+  return { isLocal: false, location: null, businessHint: '' };
+}
+
+/**
+ * Map a business hint to an OSM tag query.
+ * Returns { tags: { amenity: 'ice_cream' }, label: 'Ice Cream Shop' } or null.
+ */
+function matchBusinessType(businessHint) {
+  if (!businessHint) return null;
+  const lower = businessHint.toLowerCase();
+  // Longest match wins — sort by key length descending
+  const sorted = [...OSM_TYPE_MAP].sort((a, b) => b[0].length - a[0].length);
+  for (const [keyword, tags, label] of sorted) {
+    if (lower.includes(keyword)) {
+      return { tags, label };
+    }
+  }
+  return null;
+}
+
+/**
+ * Geocode a location string via Nominatim. Returns lat/lon/bbox or null.
+ */
+async function nominatimGeocode(location) {
+  try {
+    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(location)}&format=json&limit=1&addressdetails=1`;
+    const resp = await fetch(url, {
+      headers: { 'User-Agent': 'SEOBetter/1.5.23 (Research)' },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    if (!Array.isArray(data) || data.length === 0) return null;
+    const r = data[0];
+    return {
+      lat: parseFloat(r.lat),
+      lon: parseFloat(r.lon),
+      display_name: r.display_name,
+      // boundingbox order: [south, north, west, east] as strings
+      bbox: r.boundingbox && r.boundingbox.length === 4 ? {
+        south: parseFloat(r.boundingbox[0]),
+        north: parseFloat(r.boundingbox[1]),
+        west:  parseFloat(r.boundingbox[2]),
+        east:  parseFloat(r.boundingbox[3]),
+      } : null,
+    };
+  } catch { return null; }
+}
+
+/**
+ * Query Overpass for POIs matching the given tags inside the bbox.
+ * Returns an array of normalized place objects (up to 20).
+ */
+async function overpassQuery(tags, bbox, typeLabel) {
+  if (!tags || !bbox) return [];
+  // Build tag filter e.g. ["amenity"="ice_cream"]["cuisine"="pizza"]
+  const tagFilter = Object.entries(tags)
+    .map(([k, v]) => `["${k}"="${v}"]`)
+    .join('');
+  const bboxStr = `${bbox.south},${bbox.west},${bbox.north},${bbox.east}`;
+  const query = `[out:json][timeout:20];(node${tagFilter}(${bboxStr});way${tagFilter}(${bboxStr});relation${tagFilter}(${bboxStr}););out tags center 20;`;
+
+  try {
+    const resp = await fetch('https://overpass-api.de/api/interpreter', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': 'SEOBetter/1.5.23 (Research)',
+      },
+      body: 'data=' + encodeURIComponent(query),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    const elements = data?.elements || [];
+    return elements
+      .filter(el => el.tags && el.tags.name) // must have a real name
+      .slice(0, 20)
+      .map(el => {
+        const t = el.tags;
+        const addr = [ t['addr:housenumber'], t['addr:street'] ].filter(Boolean).join(' ');
+        const city = [ t['addr:city'], t['addr:postcode'], t['addr:country'] ].filter(Boolean).join(' ');
+        const fullAddr = [addr, city].filter(Boolean).join(', ') || null;
+        const lat = el.lat || el.center?.lat;
+        const lon = el.lon || el.center?.lon;
+        const elType = el.type; // node | way | relation
+        return {
+          name: t.name,
+          type: typeLabel,
+          address: fullAddr,
+          website: t.website || t['contact:website'] || null,
+          phone: t.phone || t['contact:phone'] || null,
+          opening_hours: t.opening_hours || null,
+          cuisine: t.cuisine || null,
+          lat,
+          lon,
+          osm_url: `https://www.openstreetmap.org/${elType}/${el.id}`,
+          source: 'OpenStreetMap',
+        };
+      });
+  } catch { return []; }
+}
+
+/**
+ * Main OSM places fetcher — called from the freeSearches parallel batch.
+ * Returns { places: [...], location: string | null, isLocal: bool }.
+ * Returns { places: [], ... } on any failure so generation still proceeds.
+ */
+async function fetchOSMPlaces(keyword, country) {
+  const intent = detectLocalIntent(keyword);
+  if (!intent.isLocal) {
+    return { places: [], location: null, isLocal: false, business_type: null };
+  }
+
+  // If no explicit location but we have a country code, use country as fallback
+  let locationQuery = intent.location;
+  if (!locationQuery && country) {
+    locationQuery = country;
+  }
+  if (!locationQuery) {
+    return { places: [], location: null, isLocal: true, business_type: null };
+  }
+
+  // Detect business type
+  const businessMatch = matchBusinessType(intent.businessHint);
+  if (!businessMatch) {
+    // Unknown business type — can't query Overpass by tag
+    return { places: [], location: locationQuery, isLocal: true, business_type: null };
+  }
+
+  // Geocode
+  const geo = await nominatimGeocode(locationQuery);
+  if (!geo || !geo.bbox) {
+    return { places: [], location: locationQuery, isLocal: true, business_type: businessMatch.label };
+  }
+
+  // Query Overpass
+  const places = await overpassQuery(businessMatch.tags, geo.bbox, businessMatch.label);
+
+  return {
+    places,
+    location: geo.display_name || locationQuery,
+    isLocal: true,
+    business_type: businessMatch.label,
+    lat: geo.lat,
+    lon: geo.lon,
+  };
 }
 
 // ============================================================
@@ -1941,7 +2194,7 @@ function fetchSpaceflightNews(keyword) {
 // BUILD RESULT
 // ============================================================
 
-function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryData, domain, ddg, social) {
+function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryData, domain, ddg, social, placesData) {
   const now = new Date();
   const monthYear = now.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
   const year = now.getFullYear();
@@ -2144,6 +2397,46 @@ function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryD
     });
   }
 
+  // ---- v1.5.23 — OSM Places (real local businesses, anti-hallucination grounding) ----
+  // Every place found in Nominatim+Overpass gets added to `sources[]` so the
+  // OSM URL flows through the Citation Pool into the References section. The
+  // places are also formatted into a dedicated "REAL LOCAL PLACES" prompt
+  // block below (see line search for placesBlockForPrompt).
+  const placesForPrompt = [];
+  if (placesData?.places?.length) {
+    placesData.places.forEach(pl => {
+      // Source entry — OSM URL is always citable since we whitelisted it
+      sources.push({
+        url: pl.osm_url,
+        title: pl.name + (pl.address ? ' — ' + pl.address : ''),
+        source_name: 'OpenStreetMap',
+      });
+      // If the place has its own website, add that too so it's pooled
+      if (pl.website && /^https?:\/\//.test(pl.website)) {
+        sources.push({
+          url: pl.website,
+          title: pl.name + ' (official website)',
+          source_name: 'Business Website',
+        });
+      }
+      // Format for the dedicated places prompt block
+      const parts = [ `**${pl.name}**` ];
+      if (pl.type) parts.push(`(${pl.type})`);
+      if (pl.address) parts.push(`— ${pl.address}`);
+      placesForPrompt.push({
+        line: parts.join(' '),
+        detail: [
+          pl.website ? `Website: ${pl.website}` : null,
+          pl.phone ? `Phone: ${pl.phone}` : null,
+          pl.opening_hours ? `Hours: ${pl.opening_hours}` : null,
+          `OSM: ${pl.osm_url}`,
+        ].filter(Boolean).join(' | '),
+      });
+      // Add a stat-style attribution so the AI can cite it inline
+      stats.push(`${pl.name} is a real ${pl.type || 'local business'}${pl.address ? ' at ' + pl.address : ''} (OpenStreetMap, ${year})`);
+    });
+  }
+
   // Deduplicate sources by URL
   const uniqueSources = [];
   const seenUrls = new Set();
@@ -2183,6 +2476,23 @@ function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryD
     trending.slice(0, 5).forEach(t => p.push(`- ${t}`));
   }
 
+  // v1.5.23 — REAL LOCAL PLACES block (closed-menu grounding to prevent
+  // hallucinated businesses). The PLACES RULES in the system prompt reference
+  // this exact section heading. If empty, we include a warning instead so the
+  // AI knows not to invent businesses.
+  if (placesData?.isLocal) {
+    if (placesForPrompt.length > 0) {
+      p.push(`\nREAL LOCAL PLACES in ${placesData.location} (use ONLY these businesses — do NOT invent any others):`);
+      placesForPrompt.forEach((pl, i) => {
+        p.push(`${i + 1}. ${pl.line}`);
+        if (pl.detail) p.push(`   ${pl.detail}`);
+      });
+      p.push(`\n(${placesForPrompt.length} real ${placesData.business_type || 'place'}s verified via OpenStreetMap. Per PLACES RULES, you MUST use only these exact names and addresses — no fabricated businesses.)`);
+    } else {
+      p.push('\nLOCAL-INTENT WARNING: This keyword asks about local businesses but the OpenStreetMap lookup returned ZERO verified places. The location may be too small for OSM coverage OR the business type wasn\'t recognized. DO NOT invent business names. Per PLACES RULES, write a general informational article without naming specific businesses, and add a disclaimer paragraph at the end suggesting readers check Google Maps or OpenStreetMap directly.');
+    }
+  }
+
   if (uniqueSources.length) {
     p.push('\nSOURCES FOR REFERENCES SECTION (use these as outbound links):');
     uniqueSources.slice(0, 20).forEach(s => p.push(`- [${s.title}](${s.url}) — ${s.source_name}`));
@@ -2210,6 +2520,11 @@ function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryD
     mastodon_count: social?.mastodon?.posts?.length || 0,
     devto_count: social?.devto?.posts?.length || 0,
     lemmy_count: social?.lemmy?.posts?.length || 0,
+    // v1.5.23 — local-intent + OSM places telemetry
+    is_local_intent: !!placesData?.isLocal,
+    places_count: placesData?.places?.length || 0,
+    places_location: placesData?.location || null,
+    places_business_type: placesData?.business_type || null,
     searched_at: now.toISOString(),
   };
 }
