@@ -866,6 +866,109 @@ async function fetchGooglePlaces(businessHint, geo, apiKey) {
 }
 
 /**
+ * v1.5.30 — Perplexity Sonar via OpenRouter (Tier 0 of the Places waterfall).
+ *
+ * Sonar is a web-search-capable LLM that pulls real business data from
+ * TripAdvisor, Yelp, Wikivoyage, and local blogs with citations. Best
+ * coverage for small cities worldwide where OSM/Foursquare/HERE have gaps.
+ * User-provided OpenRouter API key.
+ *
+ * Cost: ~$0.008 per article on `perplexity/sonar` (base), ~$0.06 on
+ * `perplexity/sonar-pro` (deeper search). User covers the cost directly
+ * via their own OpenRouter account.
+ *
+ * Returns the same normalized place shape as the other fetchers. Returns
+ * [] on any error, 401, or JSON parse failure — falls through to OSM.
+ */
+async function fetchSonarPlaces(keyword, geo, sonarConfig) {
+  if (!sonarConfig || !sonarConfig.key) return [];
+  const apiKey = sonarConfig.key;
+  const model = sonarConfig.model || 'perplexity/sonar';
+  const location = (geo && geo.display_name) || '';
+  if (!location) return [];
+
+  try {
+    const systemPrompt = `You are a local business research tool. Given a keyword about local businesses in a city, search the web and return a JSON object with a "places" array of REAL verified businesses.
+
+Each place entry must include these fields:
+- name (string, required): exact business name
+- address (string, required): full street address including street number and postal code
+- website (string, optional): official business website URL if you find it
+- phone (string, optional): phone number with country code if available
+- source_url (string, required): the specific web page URL where you found this business (TripAdvisor listing page, Yelp listing, Wikivoyage section, local blog post)
+- rating (number, optional): star rating on a 1-5 scale if available
+- type (string, required): short category label like "Ice Cream Shop", "Pizzeria", "Hotel"
+
+CRITICAL RULES:
+1. Return ONLY real businesses that exist at real addresses. NEVER invent or guess.
+2. If you cannot find at least 3 real verified businesses for the given location, return an empty places array.
+3. Prefer recent (2024-2026) mentions over older sources.
+4. Each source_url must be a specific page, not a homepage.
+5. Return valid JSON matching this exact shape: {"places": [{...}, ...]}`;
+
+    const userPrompt = `Keyword: "${keyword}"\nLocation: ${location}\n\nFind 5-10 real verified businesses matching the keyword in this location and return them as JSON.`;
+
+    const resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+        'HTTP-Referer': 'https://seobetter.vercel.app',
+        'X-Title': 'SEOBetter Places Waterfall',
+      },
+      body: JSON.stringify({
+        model: model,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+        response_format: { type: 'json_object' },
+        max_tokens: 2000,
+        temperature: 0.1,
+      }),
+      signal: AbortSignal.timeout(30000),
+    });
+
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    const content = data?.choices?.[0]?.message?.content || '';
+    if (!content) return [];
+
+    let parsed;
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      // Some models wrap JSON in markdown fences — try to extract
+      const match = content.match(/\{[\s\S]*\}/);
+      if (!match) return [];
+      try { parsed = JSON.parse(match[0]); } catch { return []; }
+    }
+
+    const places = parsed?.places || [];
+    if (!Array.isArray(places)) return [];
+
+    return places
+      .filter(p => p && p.name && p.address)
+      .map(p => ({
+        name: String(p.name || '').trim(),
+        type: String(p.type || 'Local Business').trim(),
+        address: String(p.address || '').trim(),
+        website: (p.website && /^https?:\/\//.test(p.website)) ? p.website : null,
+        phone: p.phone ? String(p.phone).trim() : null,
+        rating: (typeof p.rating === 'number' && p.rating > 0 && p.rating <= 5) ? p.rating : null,
+        lat: (typeof p.lat === 'number') ? p.lat : (geo?.lat ?? null),
+        lon: (typeof p.lon === 'number') ? p.lon : (geo?.lon ?? null),
+        source_url: (p.source_url && /^https?:\/\//.test(p.source_url)) ? p.source_url : null,
+        source: 'Perplexity Sonar',
+      }))
+      .filter(p => p.name && p.address)
+      .slice(0, 10);
+  } catch {
+    return [];
+  }
+}
+
+/**
  * v1.5.24 — 5-tier places waterfall. Replaces the v1.5.23 OSM-only fetcher.
  *
  * Stops at the first tier returning >=3 places, so non-local queries and
@@ -901,8 +1004,20 @@ async function fetchPlacesWaterfall(keyword, country, placesKeys = {}) {
   let places = [];
   let provider_used = null;
 
+  // ---- Tier 0: Perplexity Sonar via OpenRouter (v1.5.30, user key, paid) ----
+  // Web-search LLM with the best small-city coverage worldwide. Stops the
+  // Lucignano-class failure where OSM/Foursquare/HERE all return empty for
+  // tiny tourist towns but TripAdvisor/Yelp have real listings. User covers
+  // the cost via their own OpenRouter account (~$0.008/article on base sonar).
+  if (placesKeys && placesKeys.openrouter_sonar && placesKeys.openrouter_sonar.key) {
+    const sonar = await fetchSonarPlaces(keyword, geo, placesKeys.openrouter_sonar);
+    places = places.concat(sonar);
+    providers_tried.push({ name: 'Perplexity Sonar', count: sonar.length });
+    if (places.length >= 3) provider_used = 'Perplexity Sonar';
+  }
+
   // ---- Tier 1: OSM / Overpass (free, always on) ----
-  if (businessMatch && geo.bbox) {
+  if (!provider_used && businessMatch && geo.bbox) {
     const osmPlaces = await overpassQuery(businessMatch.tags, geo.bbox, businessMatch.label);
     places = places.concat(osmPlaces);
     providers_tried.push({ name: 'OpenStreetMap', count: osmPlaces.length });
