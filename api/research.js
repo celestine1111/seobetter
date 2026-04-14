@@ -1011,6 +1011,13 @@ function getCategorySearches(domain, keyword) {
     technology:     [() => fetchHackerNewsTop(), () => fetchCrossref(keyword)],
     education:      [() => fetchUniversitiesList(keyword), () => fetchNobelPrize(keyword), () => fetchCrossref(keyword), () => fetchOpenLibrary(keyword), () => fetchWorldBank(keyword)],
     transportation: [() => fetchOpenSky(), () => fetchOpenChargeMap(keyword), () => fetchADSBExchange(), () => fetchCityBikes(), () => fetchNHTSA(keyword)],
+    // v1.5.28 — NEW: travel & tourism category. Routes to destination facts
+    // (REST Countries), climate/weather (OpenMeteo), daylight times
+    // (Sunrise-Sunset), and public holidays (NagerDate) for the destination.
+    // Wikipedia runs as always-on already and adds destination summaries.
+    // The Places waterfall (OSM → Foursquare → HERE → Google Places) runs
+    // independently of category and handles the actual business listings.
+    travel:         [() => fetchRestCountries(keyword, ''), () => fetchOpenMeteo(keyword), () => fetchSunriseSunset(), () => fetchNagerDate()],
     news:           [() => fetchSpaceflightNews(keyword), () => fetchHackerNewsTop(), () => fetchFederalRegister()],
     ecommerce:      [() => fetchOpenFoodFacts(keyword)],
     business:       [() => fetchEcondb(keyword), () => fetchWorldBank(keyword), () => fetchFedTreasury()],
@@ -2256,6 +2263,36 @@ function fetchSunriseSunset() {
       url: 'https://sunrise-sunset.org/',
       source: 'Sunrise-Sunset.org',
     }]};
+  })() };
+}
+
+// v1.5.28 — REST Countries — free country facts (capital, pop, languages,
+// currency, region, subregion, timezones). Used by the travel category to
+// inject destination context into tourism articles. No API key required.
+function fetchRestCountries(keyword, country) {
+  return { name: 'REST Countries', source: 'REST Countries', promise: (async () => {
+    // Prefer the explicit country param, fall back to extracting a country name
+    // from the keyword (last capitalized word is a reasonable heuristic).
+    let query = country || '';
+    if (!query) {
+      const m = keyword.match(/\b([A-Z][a-z]{2,})\b/g);
+      if (m && m.length) query = m[m.length - 1];
+    }
+    if (!query) return { stats: [] };
+    const data = await safeFetch(`https://restcountries.com/v3.1/name/${encodeURIComponent(query)}?fullText=false`);
+    if (!Array.isArray(data) || !data.length) return { stats: [] };
+    const c = data[0];
+    const name = c.name?.common || query;
+    const capital = (c.capital && c.capital[0]) || '';
+    const pop = c.population ? c.population.toLocaleString('en-US') : '';
+    const region = c.subregion || c.region || '';
+    const currency = c.currencies ? Object.keys(c.currencies)[0] : '';
+    const langs = c.languages ? Object.values(c.languages).slice(0, 3).join(', ') : '';
+    const tz = (c.timezones && c.timezones[0]) || '';
+    const stats = [];
+    if (capital) stats.push({ text: `${name} — capital ${capital}, population ${pop}, ${region} (REST Countries, ${new Date().getFullYear()})`, url: `https://restcountries.com/v3.1/name/${encodeURIComponent(query)}`, source: 'REST Countries' });
+    if (langs) stats.push({ text: `${name} official languages: ${langs}, currency ${currency}, timezone ${tz} (REST Countries, ${new Date().getFullYear()})`, url: `https://restcountries.com/`, source: 'REST Countries' });
+    return { stats };
   })() };
 }
 
