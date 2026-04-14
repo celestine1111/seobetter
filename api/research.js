@@ -909,17 +909,19 @@ async function fetchPlacesWaterfall(keyword, country, placesKeys = {}) {
     if (places.length >= 3) provider_used = 'OpenStreetMap';
   }
 
-  // ---- Tier 2: Wikidata (free, always on) ----
-  if (!provider_used) {
-    const wd = await fetchWikidataPlaces(businessHint, geo);
-    places = places.concat(wd);
-    providers_tried.push({ name: 'Wikidata', count: wd.length });
-    if (places.length >= 3) {
-      provider_used = places.length > wd.length ? 'OpenStreetMap + Wikidata' : 'Wikidata';
-    }
-  }
+  // ---- Tier 2: Wikidata — REMOVED in v1.5.26 ----
+  // Wikidata is an encyclopedic entity database, not a business directory. The
+  // SPARQL `geo:around` query returns ANY entity with coordinates within radius
+  // (churches, hamlets, heritage buildings, town halls) regardless of the
+  // requested business type, because small commercial businesses like gelaterie
+  // are by definition non-notable to Wikidata. In v1.5.24 testing against
+  // Lucignano, Wikidata returned 20 wrong-type results (churches in nearby
+  // Sinalunga and Torrita di Siena) which short-circuited the waterfall and
+  // prevented Foursquare from ever running. The `fetchWikidataPlaces` function
+  // is kept as dead code for possible future use on cultural-heritage keywords
+  // ("oldest churches in X") but is no longer called by the business waterfall.
 
-  // ---- Tier 3: Foursquare (free, user key) ----
+  // ---- Tier 2: Foursquare (free, user key) ----
   if (!provider_used && placesKeys && placesKeys.foursquare) {
     const fsq = await fetchFoursquarePlaces(businessHint, geo, placesKeys.foursquare);
     places = places.concat(fsq);
@@ -2792,6 +2794,11 @@ function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryD
     lemmy_count: social?.lemmy?.posts?.length || 0,
     // v1.5.23/v1.5.24 — local-intent + Places waterfall telemetry
     is_local_intent: !!placesData?.isLocal,
+    // v1.5.26 — expose the full normalized places array so the WordPress
+    // Places_Validator can use it as the closed-menu allow-list during
+    // post-generation validation. Each entry has { name, type, address,
+    // website, phone, lat, lon, source_url, source }. Capped at 20.
+    places: placesData?.places || [],
     places_count: placesData?.places?.length || 0,
     places_location: placesData?.location || null,
     places_business_type: placesData?.business_type || null,
