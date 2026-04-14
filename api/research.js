@@ -898,6 +898,7 @@ Each place entry must include these fields:
 - source_url (string, required): the specific web page URL where you found this business (TripAdvisor listing page, Yelp listing, Wikivoyage section, local blog post)
 - rating (number, optional): star rating on a 1-5 scale if available
 - type (string, required): short category label like "Ice Cream Shop", "Pizzeria", "Hotel"
+- photo_url (string, optional): a direct https URL to a photo of the business if the source page has one (og:image, first image of the listing, etc). Prefer stable CDN URLs. Skip if unsure.
 
 CRITICAL RULES:
 1. Return ONLY real businesses that exist at real addresses. NEVER invent or guess.
@@ -959,6 +960,11 @@ CRITICAL RULES:
         lat: (typeof p.lat === 'number') ? p.lat : (geo?.lat ?? null),
         lon: (typeof p.lon === 'number') ? p.lon : (geo?.lon ?? null),
         source_url: (p.source_url && /^https?:\/\//.test(p.source_url)) ? p.source_url : null,
+        // v1.5.31 — photo URL scraped by Sonar from the source page (og:image,
+        // listing thumbnail, etc). Only https URLs are accepted. May be hot-
+        // linked from a CDN that rotates — acceptable for a post-gen feature
+        // since the article can be regenerated if photos break.
+        photo_url: (p.photo_url && /^https:\/\//.test(p.photo_url)) ? p.photo_url : null,
         source: 'Perplexity Sonar',
       }))
       .filter(p => p.name && p.address)
