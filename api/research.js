@@ -2703,19 +2703,26 @@ function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryD
   }
 
   // ---- v1.5.23 — OSM Places (real local businesses, anti-hallucination grounding) ----
-  // Every place found in Nominatim+Overpass gets added to `sources[]` so the
-  // OSM URL flows through the Citation Pool into the References section. The
+  // Every place found in the waterfall gets added to `sources[]` so the
+  // source URL flows through the Citation Pool into the References section. The
   // places are also formatted into a dedicated "REAL LOCAL PLACES" prompt
   // block below (see line search for placesBlockForPrompt).
+  // v1.5.29 — use the generic `source_url` field that all tiers populate
+  // (OSM fills it as osm_url, Foursquare as fsq_url, HERE as here_url, etc)
+  // so non-OSM provider URLs also flow to References.
   const placesForPrompt = [];
   if (placesData?.places?.length) {
     placesData.places.forEach(pl => {
-      // Source entry — OSM URL is always citable since we whitelisted it
-      sources.push({
-        url: pl.osm_url,
-        title: pl.name + (pl.address ? ' — ' + pl.address : ''),
-        source_name: 'OpenStreetMap',
-      });
+      // Source entry — provider URL is always citable since we whitelisted it
+      const providerUrl = pl.source_url || pl.osm_url || null;
+      const providerName = pl.source || 'OpenStreetMap';
+      if (providerUrl) {
+        sources.push({
+          url: providerUrl,
+          title: pl.name + (pl.address ? ' — ' + pl.address : ''),
+          source_name: providerName,
+        });
+      }
       // If the place has its own website, add that too so it's pooled
       if (pl.website && /^https?:\/\//.test(pl.website)) {
         sources.push({
