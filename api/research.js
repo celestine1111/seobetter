@@ -24,7 +24,7 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Use POST.' });
 
-  const { keyword, site_url, brave_key, domain, country, places_keys, test_all_places_tiers } = req.body || {};
+  const { keyword, site_url, brave_key, domain, country, places_keys, test_all_places_tiers, test_all_sources } = req.body || {};
 
   if (!keyword) {
     return res.status(400).json({ error: 'keyword is required.' });
@@ -47,6 +47,102 @@ export default async function handler(req, res) {
     // whole Promise.all and surfaces as the "Unexpected token '<' ..."
     // JSON-parse-on-HTML error that caused the test button to fail. Skip
     // them entirely in test mode and return just the places waterfall shape.
+    // v1.5.51 — TEST ALL SOURCES diagnostic. Runs every always-on free source
+    // independently via Promise.allSettled so one failing source cannot block
+    // the others, and returns a per-source { ok, latency_ms, count, error,
+    // sample } map. Lets the user see at a glance which sources are flaking.
+    if (test_all_sources) {
+      const testKw = keyword || 'small business marketing 2026';
+      const startTotal = Date.now();
+
+      // Helper: instrument a source promise with latency + error capture
+      const instrument = async (name, promise) => {
+        const t0 = Date.now();
+        try {
+          const data = await promise;
+          const latency = Date.now() - t0;
+          // Derive a count based on the shape each source returns
+          let count = 0;
+          let sample = null;
+          if (data && typeof data === 'object') {
+            if (Array.isArray(data)) { count = data.length; sample = data[0] || null; }
+            else if (Array.isArray(data.posts))    { count = data.posts.length;    sample = data.posts[0] || null; }
+            else if (Array.isArray(data.results))  { count = data.results.length;  sample = data.results[0] || null; }
+            else if (Array.isArray(data.items))    { count = data.items.length;    sample = data.items[0] || null; }
+            else if (Array.isArray(data.articles)) { count = data.articles.length; sample = data.articles[0] || null; }
+            else if (Array.isArray(data.stats))    { count = data.stats.length;    sample = data.stats[0] || null; }
+            else if (Array.isArray(data.quotes))   { count = data.quotes.length;   sample = data.quotes[0] || null; }
+            else if (Array.isArray(data.trends))   { count = data.trends.length;   sample = data.trends[0] || null; }
+            else if (data.summary) { count = 1; sample = { summary: String(data.summary).slice(0, 120) }; }
+            else { count = Object.keys(data).length > 0 ? 1 : 0; sample = null; }
+          }
+          // Truncate sample to keep the response small
+          let sampleStr = '';
+          if (sample) {
+            try { sampleStr = JSON.stringify(sample).slice(0, 200); }
+            catch (_) { sampleStr = String(sample).slice(0, 200); }
+          }
+          return { name, ok: true, latency_ms: latency, count, sample: sampleStr };
+        } catch (err) {
+          return {
+            name,
+            ok: false,
+            latency_ms: Date.now() - t0,
+            count: 0,
+            error: (err && err.message) ? err.message : String(err),
+          };
+        }
+      };
+
+      const sourceTasks = [
+        instrument('Reddit',         searchReddit(testKw)),
+        instrument('Hacker News',    searchHackerNews(testKw)),
+        instrument('Wikipedia',      searchWikipedia(testKw)),
+        instrument('Google Trends',  searchGoogleTrends(testKw)),
+        instrument('DuckDuckGo',     searchDuckDuckGo(testKw)),
+        instrument('Bluesky',        searchBluesky(testKw)),
+        instrument('Mastodon',       searchMastodon(testKw)),
+        instrument('Dev.to',         searchDevTo(testKw)),
+        instrument('Lemmy',          searchLemmy(testKw)),
+      ];
+      if (brave_key) {
+        sourceTasks.push(instrument('Brave Search (Pro)', searchBrave(testKw, brave_key)));
+      }
+
+      // Category + country APIs — surface which ones are configured for this
+      // domain/country and whether each one succeeds
+      const catEntries     = getCategorySearches(domain || 'general', testKw);
+      const countryEntries = country ? getCountrySearches(country, testKw, domain) : [];
+      const allCatEntries  = [...catEntries, ...countryEntries];
+      allCatEntries.forEach(e => {
+        sourceTasks.push(instrument(`${e.name} (${e.source})`, e.promise));
+      });
+
+      const sourceResults = await Promise.all(sourceTasks);
+
+      // Summary: ok / failed / empty
+      const okCount     = sourceResults.filter(r => r.ok && r.count > 0).length;
+      const emptyCount  = sourceResults.filter(r => r.ok && r.count === 0).length;
+      const errorCount  = sourceResults.filter(r => !r.ok).length;
+
+      return res.status(200).json({
+        success: true,
+        test_mode: 'all_sources',
+        keyword: testKw,
+        domain: domain || 'general',
+        country: country || '',
+        brave_configured: !!brave_key,
+        total_latency_ms: Date.now() - startTotal,
+        summary: {
+          total:  sourceResults.length,
+          ok:     okCount,
+          empty:  emptyCount,
+          errors: errorCount,
+        },
+        sources: sourceResults,
+      });
+    }
+
     if (test_all_places_tiers) {
       const placesData = await fetchPlacesWaterfall(keyword, country, places_keys || {}, { runAllTiers: true });
       return res.status(200).json({
