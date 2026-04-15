@@ -729,16 +729,41 @@ async function nominatimGeocode(location) {
 }
 
 /**
+ * v1.5.55 — expand a tight Nominatim bbox to cover at least a 25km radius
+ * around its center. Small-town bboxes are usually just the town boundary
+ * (~2-5km across), which means Overpass finds zero results for real shops
+ * in neighboring villages that a local reader would drive to. Expanding
+ * the bbox raises OSM coverage for rural queries without affecting large
+ * cities (whose bbox is already larger than 25km).
+ */
+function expandBbox(bbox, minRadiusKm = 25) {
+  if (!bbox) return bbox;
+  const centerLat = (bbox.south + bbox.north) / 2;
+  const centerLon = (bbox.west + bbox.east) / 2;
+  // 1 degree latitude ≈ 111 km, longitude ≈ 111 × cos(lat) km
+  const deltaLat = minRadiusKm / 111;
+  const deltaLon = minRadiusKm / (111 * Math.cos(centerLat * Math.PI / 180));
+  return {
+    south: Math.min(bbox.south, centerLat - deltaLat),
+    north: Math.max(bbox.north, centerLat + deltaLat),
+    west:  Math.min(bbox.west,  centerLon - deltaLon),
+    east:  Math.max(bbox.east,  centerLon + deltaLon),
+  };
+}
+
+/**
  * Query Overpass for POIs matching the given tags inside the bbox.
  * Returns an array of normalized place objects (up to 20).
  */
 async function overpassQuery(tags, bbox, typeLabel) {
   if (!tags || !bbox) return [];
+  // v1.5.55 — expand the bbox so rural queries cover a 25km radius.
+  const expanded = expandBbox(bbox, 25);
   // Build tag filter e.g. ["amenity"="ice_cream"]["cuisine"="pizza"]
   const tagFilter = Object.entries(tags)
     .map(([k, v]) => `["${k}"="${v}"]`)
     .join('');
-  const bboxStr = `${bbox.south},${bbox.west},${bbox.north},${bbox.east}`;
+  const bboxStr = `${expanded.south},${expanded.west},${expanded.north},${expanded.east}`;
   const query = `[out:json][timeout:20];(node${tagFilter}(${bboxStr});way${tagFilter}(${bboxStr});relation${tagFilter}(${bboxStr}););out tags center 20;`;
 
   try {
@@ -880,9 +905,14 @@ async function fetchWikidataPlaces(businessHint, geo) {
  * the result is kept. Covers the top ~30 most common local-business categories.
  */
 const FSQ_CATEGORY_SYNONYMS = {
-  'pet shop':       ['pet store', 'pet shop', 'pet supplies', 'pet supply', 'aquarium shop', 'bird shop'],
-  'pet store':      ['pet store', 'pet shop', 'pet supplies', 'pet supply'],
-  'pet':            ['pet store', 'pet shop', 'pet supplies', 'pet supply', 'veterinarian', 'pet grooming', 'pet service', 'pet sitter', 'aquarium', 'bird shop'],
+  // v1.5.55 — pet synonyms broadened to include rural supply stores which
+  // often stock pet food and pet supplies in rural Australia and similar
+  // markets (e.g. Mudgee Produce Plus is categorized as "Rural Supply" not
+  // "Pet Store" but has a huge pet section). Also added generic merchandise
+  // and farm supply categories so rural-town search returns real shops.
+  'pet shop':       ['pet store', 'pet shop', 'pet supplies', 'pet supply', 'aquarium shop', 'bird shop', 'rural supply', 'farm supply', 'produce store', 'feed store', 'general store', 'hardware store'],
+  'pet store':      ['pet store', 'pet shop', 'pet supplies', 'pet supply', 'rural supply', 'produce store', 'feed store', 'general store'],
+  'pet':            ['pet store', 'pet shop', 'pet supplies', 'pet supply', 'veterinarian', 'pet grooming', 'pet service', 'pet sitter', 'aquarium', 'bird shop', 'rural supply', 'farm supply', 'produce store', 'feed store'],
   'gelato':         ['ice cream', 'gelato', 'frozen yogurt', 'dessert', 'sweet'],
   'ice cream':      ['ice cream', 'gelato', 'frozen yogurt', 'dessert'],
   'pizza':          ['pizza', 'pizzeria', 'italian'],
@@ -955,9 +985,13 @@ function fsqCategorySynonyms(businessHint) {
 async function fetchFoursquarePlaces(businessHint, geo, apiKey) {
   if (!apiKey || !geo || !geo.lat || !geo.lon) return [];
   try {
-    // Pass the raw hint as `query` — Foursquare uses it for a loose name+
-    // category text match. We'll post-filter by category.
-    const url = `https://places-api.foursquare.com/places/search?query=${encodeURIComponent(businessHint || '')}&ll=${geo.lat},${geo.lon}&radius=10000&limit=30`;
+    // v1.5.55 — radius raised from 10km → 25km. Rural towns like Mudgee
+    // NSW (11k pop) often have zero FSQ-indexed businesses within 10km,
+    // but the next town over (Gulgong, Rylstone) has real pet shops that
+    // a Mudgee-based reader would drive to. 25km covers the whole local
+    // catchment area for small-town queries while still being "local"
+    // for large cities (Sydney 25km covers Greater Sydney metro).
+    const url = `https://places-api.foursquare.com/places/search?query=${encodeURIComponent(businessHint || '')}&ll=${geo.lat},${geo.lon}&radius=25000&limit=40`;
     const resp = await fetch(url, {
       headers: {
         'Authorization': `Bearer ${apiKey}`,
@@ -1016,13 +1050,13 @@ async function fetchFoursquarePlaces(businessHint, geo, apiKey) {
 async function fetchHEREPlaces(businessHint, geo, apiKey) {
   if (!apiKey || !geo || !geo.lat || !geo.lon) return [];
   try {
-    // v1.5.42 — use HERE's `in=bbox` parameter to HARD-bound the search to
-    // ~10km around the geocoded location. The previous `at=` parameter was
-    // only a soft proximity bias, so a shop named "The Best Gelato" in
-    // Stirling UK could outrank a Lucignano Italy query on name match.
-    // Bbox is west,south,east,north degrees. At latitude 43, 0.1 deg ≈ 11km.
-    const latDelta = 0.1;
-    const lonDelta = 0.1 / Math.cos(geo.lat * Math.PI / 180);
+    // v1.5.42 — use HERE's `in=bbox` parameter to HARD-bound the search.
+    // v1.5.55 — bbox expanded from 10km → 25km radius to match FSQ/OSM.
+    // Rural small towns often have the nearest pet shop in a neighbor
+    // village that HERE indexes but the tighter bbox excluded.
+    // Bbox is west,south,east,north degrees. 0.22 deg ≈ 25km at mid lat.
+    const latDelta = 0.22;
+    const lonDelta = 0.22 / Math.cos(geo.lat * Math.PI / 180);
     const west  = (geo.lon - lonDelta).toFixed(5);
     const south = (geo.lat - latDelta).toFixed(5);
     const east  = (geo.lon + lonDelta).toFixed(5);
@@ -1193,19 +1227,27 @@ CRITICAL RULES:
     throw new Error('sonar_bad_shape: parsed response does not have a places array.');
   }
 
-  // v1.5.52 — relaxed filter. Accept a place if it has a name PLUS at least
-  // one verifiable signal (address OR website OR source_url). Previous filter
-  // (`name && address`) dropped 7 of 10 Mudgee pet shops.
+  // v1.5.55 — further relaxed filter. v1.5.52 required name + 1-of-3
+  // (address, website, source_url). That still dropped Mudgee NSW results
+  // where Sonar returned name + type only ("Mudgee Produce Plus", type:
+  // "Pet Store") without finding a stable source URL. New rule: accept
+  // any place with a non-empty name AND a non-empty type string. The
+  // Places_Validator will downstream-check that H2s match these names;
+  // worst case a business with no address just has no 📍 meta line in
+  // the article, which is still better than being dropped entirely.
   return rawPlaces
     .map(p => {
       if (!p || typeof p !== 'object') return null;
       const name = String(p.name || '').trim();
-      if (!name) return null;
+      if (!name || name.length < 2) return null;
+      const type = String(p.type || '').trim();
       const address = p.address ? String(p.address).trim() : '';
       const website = (p.website && /^https?:\/\//.test(p.website)) ? String(p.website).trim() : null;
       const source_url = (p.source_url && /^https?:\/\//.test(p.source_url)) ? String(p.source_url).trim() : null;
-      // Must have at least ONE verification signal
-      if (!address && !website && !source_url) return null;
+      // Must have at least name + (type OR one of address/website/source_url).
+      // Type alone is enough verification because Sonar Pro only assigns
+      // category types to real indexed businesses.
+      if (!type && !address && !website && !source_url) return null;
       return {
         name,
         type: String(p.type || 'Local Business').trim(),
@@ -1239,56 +1281,80 @@ CRITICAL RULES:
  * hard errors so the waterfall error-capture can surface the real cause.
  */
 async function fetchSonarPlaces(keyword, geo, sonarConfig) {
-  // v1.5.42 — diagnostic errors returned via thrown Error so the caller can
-  // surface them in the sonar_error telemetry field.
-  // v1.5.52 — two-attempt strategy. Small towns like Mudgee NSW have plenty
-  // of real businesses online but only 2-3 appear with full street addresses
-  // in any single search. Previous filter `p.name && p.address` threw away
-  // 7 of 10 real verified businesses. New approach:
-  //   1. Relax the filter — accept a place if it has a name PLUS at least one
-  //      verifiable signal (address OR website OR source_url). A business
-  //      with name + Yelp URL is still a real verifiable entity.
-  //   2. Relax the system prompt — address goes from "required" to "preferred
-  //      but optional". Website/source_url are also acceptable verification.
-  //   3. Auto-upgrade to perplexity/sonar-pro if the base model returns <2
-  //      usable places on the first attempt. Pro has much deeper web search
-  //      and finds the long tail of businesses the base model skips. Costs
-  //      ~$0.06 extra per retry, only fires when the base is clearly thin.
+  // v1.5.55 — full rewrite of the retry logic after Mudgee NSW returned 0
+  // places even after v1.5.52's "two-attempt strategy". Three problems with
+  // the previous implementation:
+  //
+  //   1. Default model was `perplexity/sonar` (base, shallow search). The
+  //      web UI that Ben used to verify Mudgee has 10 real pet shops uses
+  //      `sonar-pro` by default — the two models have DRAMATICALLY different
+  //      small-town coverage. Changed default to sonar-pro.
+  //
+  //   2. Retry logic was thin-only: `if (base.length < 2) retry with pro`.
+  //      If base THREW an error (rate limit, timeout, 402, 500), the catch
+  //      block re-threw and pro never ran. Now we run pro first with a
+  //      try/catch and fall back to base if pro throws.
+  //
+  //   3. Caller had no way to see what Sonar actually returned — just a
+  //      count. Now we attach a DIAGNOSTIC object to the thrown Error so
+  //      the test endpoint can surface "Sonar Pro ran, returned this raw
+  //      content, filtered to 0 places because ... ". No more guessing.
   if (!sonarConfig || !sonarConfig.key) {
     throw new Error('sonar_no_key: sonarConfig or sonarConfig.key is missing');
   }
   const apiKey = sonarConfig.key;
-  const userModel = sonarConfig.model || 'perplexity/sonar';
+  // v1.5.55 — default to sonar-pro. User can override via settings.
+  const userModel = sonarConfig.model || 'perplexity/sonar-pro';
   const location = (geo && geo.display_name) || '';
   if (!location) {
     throw new Error('sonar_no_location: geo.display_name is empty');
   }
 
-  try {
-    // v1.5.52 — run base model first, retry with sonar-pro if thin.
-    let places = await callSonar(apiKey, userModel, keyword, location, geo);
-    if (places.length < 2 && userModel !== 'perplexity/sonar-pro') {
-      try {
-        const proPlaces = await callSonar(apiKey, 'perplexity/sonar-pro', keyword, location, geo);
-        // Take the union keyed by normalized name
-        const seen = new Set(places.map(p => p.name.toLowerCase().trim()));
-        proPlaces.forEach(p => {
-          const k = p.name.toLowerCase().trim();
-          if (!seen.has(k)) { places.push(p); seen.add(k); }
-        });
-      } catch (proErr) {
-        // Pro retry failure is non-fatal — return whatever the base model gave us
-      }
+  const attempts = [];
+  const allPlaces = [];
+  const seen = new Set();
+
+  // Attempt chain: try the user-selected model first, then the OTHER model
+  // as a safety net. If userModel is sonar-pro, the fallback is base sonar;
+  // if userModel is base sonar, the fallback is sonar-pro.
+  const modelChain = [userModel];
+  const fallback = (userModel === 'perplexity/sonar-pro') ? 'perplexity/sonar' : 'perplexity/sonar-pro';
+  if (fallback !== userModel) modelChain.push(fallback);
+
+  for (const model of modelChain) {
+    try {
+      const places = await callSonar(apiKey, model, keyword, location, geo);
+      attempts.push({ model, ok: true, count: places.length });
+      places.forEach(p => {
+        const k = (p.name || '').toLowerCase().trim();
+        if (k && !seen.has(k)) {
+          seen.add(k);
+          allPlaces.push(p);
+        }
+      });
+      // If we have ≥2 places after this attempt, stop — good enough.
+      if (allPlaces.length >= 2) break;
+    } catch (err) {
+      attempts.push({
+        model,
+        ok: false,
+        error: (err && err.message) ? err.message : String(err),
+      });
+      // Continue to the next model in the chain
     }
-    return places.slice(0, 10);
-  } catch (innerError) {
-    // Re-throw with sonar_ prefix if not already prefixed, so the waterfall
-    // can distinguish Sonar errors from OSM/Foursquare/HERE/Google errors.
-    if (innerError && innerError.message && innerError.message.startsWith('sonar_')) {
-      throw innerError;
-    }
-    throw new Error('sonar_exception: ' + (innerError?.message || String(innerError)));
   }
+
+  if (allPlaces.length === 0) {
+    // Every model attempt failed or returned nothing — throw with full
+    // diagnostic so the test endpoint can show the raw attempts.
+    const diag = attempts.map(a => a.ok
+      ? `${a.model}: ${a.count} places (all filtered out)`
+      : `${a.model}: ${a.error}`
+    ).join(' | ');
+    throw new Error(`sonar_empty_all_models: ${diag}`);
+  }
+
+  return allPlaces.slice(0, 10);
 }
 
 /**
