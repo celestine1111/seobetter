@@ -866,14 +866,98 @@ async function fetchWikidataPlaces(businessHint, geo) {
 }
 
 /**
+ * v1.5.53 — Foursquare keyword → category synonym map. Used to post-filter
+ * the category-name of every Foursquare result because passing the full
+ * businessHint as a text `query` param returns junk (any business with the
+ * hint tokens in its NAME matches, e.g. "best pet shops" hit "Best Migration
+ * Services", "Best Kumpir", "Best Western Hotel", "Best Buy Pharmacy"). We
+ * still pass query for the initial search but drop anything whose category
+ * doesn't semantically match the hint.
+ *
+ * Format: each key is a substring to look for in the normalized businessHint.
+ * Each value is an array of substrings — if ANY of them appears in the result's
+ * Foursquare category name (e.g. "Ice Cream Shop", "Pet Store", "Pizzeria"),
+ * the result is kept. Covers the top ~30 most common local-business categories.
+ */
+const FSQ_CATEGORY_SYNONYMS = {
+  'pet shop':       ['pet store', 'pet shop', 'pet supplies', 'pet supply', 'aquarium shop', 'bird shop'],
+  'pet store':      ['pet store', 'pet shop', 'pet supplies', 'pet supply'],
+  'pet':            ['pet store', 'pet shop', 'pet supplies', 'pet supply', 'veterinarian', 'pet grooming', 'pet service', 'pet sitter', 'aquarium', 'bird shop'],
+  'gelato':         ['ice cream', 'gelato', 'frozen yogurt', 'dessert', 'sweet'],
+  'ice cream':      ['ice cream', 'gelato', 'frozen yogurt', 'dessert'],
+  'pizza':          ['pizza', 'pizzeria', 'italian'],
+  'restaurant':     ['restaurant', 'eatery', 'diner', 'bistro'],
+  'cafe':           ['cafe', 'coffee', 'café'],
+  'coffee':         ['coffee', 'cafe', 'café', 'espresso'],
+  'bakery':         ['bakery', 'pastry', 'bread', 'croissant', 'patisserie'],
+  'butcher':        ['butcher', 'meat shop', 'meat market'],
+  'hotel':          ['hotel', 'inn', 'resort', 'lodge', 'b&b', 'bed and breakfast'],
+  'motel':          ['motel', 'hotel', 'inn'],
+  'bar':            ['bar', 'pub', 'tavern', 'cocktail', 'wine bar', 'beer garden'],
+  'pub':            ['pub', 'bar', 'tavern', 'ale house'],
+  'winery':         ['winery', 'wine', 'vineyard', 'cellar'],
+  'brewery':        ['brewery', 'beer', 'taproom'],
+  'veterinarian':   ['veterinarian', 'vet clinic', 'animal hospital', 'pet clinic'],
+  'vet':            ['veterinarian', 'vet clinic', 'animal hospital', 'pet clinic'],
+  'dog groomer':    ['pet grooming', 'dog groomer', 'pet service'],
+  'grooming':       ['pet grooming', 'dog groomer', 'pet service', 'hair salon', 'beauty salon'],
+  'gym':            ['gym', 'fitness', 'crossfit', 'yoga studio'],
+  'fitness':        ['gym', 'fitness', 'crossfit', 'yoga'],
+  'yoga':           ['yoga', 'fitness', 'wellness'],
+  'florist':        ['florist', 'flower shop'],
+  'barber':         ['barber', 'hair salon'],
+  'hair salon':     ['hair salon', 'barber', 'beauty salon', 'hairdresser'],
+  'nail salon':     ['nail salon', 'manicure', 'nail art'],
+  'tattoo':         ['tattoo', 'piercing'],
+  'bookstore':      ['bookstore', 'book shop', 'library'],
+  'bike shop':      ['bicycle', 'bike shop', 'cycling'],
+  'bicycle':        ['bicycle', 'bike shop', 'cycling'],
+  'jeweler':        ['jeweler', 'jewelry', 'watch shop'],
+  'pharmacy':       ['pharmacy', 'drugstore', 'chemist'],
+  'dentist':        ['dentist', 'dental'],
+  'doctor':         ['doctor', 'medical center', 'clinic'],
+  'lawyer':         ['law firm', 'lawyer', 'attorney', 'legal'],
+  'accountant':     ['accountant', 'accounting', 'tax'],
+};
+
+/**
+ * Given a businessHint like "pet shops" or "gelato shops", return a list of
+ * substring patterns to match against Foursquare category names. Falls back
+ * to splitting the hint into tokens if no mapping exists.
+ */
+function fsqCategorySynonyms(businessHint) {
+  const h = (businessHint || '').toLowerCase();
+  if (!h) return [];
+  // Longest-key-first so "pet shop" beats "pet" when both match
+  const keys = Object.keys(FSQ_CATEGORY_SYNONYMS).sort((a, b) => b.length - a.length);
+  for (const key of keys) {
+    if (h.includes(key)) return FSQ_CATEGORY_SYNONYMS[key];
+  }
+  // No mapping — fall back to the hint tokens (≥4 chars, drop stopwords)
+  const stop = new Set(['best','top','good','great','shop','shops','store','stores','near','the','for','and']);
+  return h.split(/\s+/).filter(t => t.length >= 4 && !stop.has(t));
+}
+
+/**
  * Tier 3: Foursquare Places — free 1K calls/day, user API key required.
  * Best small-city coverage via user check-ins. Strong in Italy, Brazil,
  * Portugal, Asia — anywhere tourists use the app.
+ *
+ * v1.5.53 — added post-fetch category-name filter via FSQ_CATEGORY_SYNONYMS
+ * map. The plain text `query` param matches any business with the hint
+ * tokens in its NAME, not its category, so "pet shops" in Sydney returned
+ * "Best Migration Services", "Best Kumpir", "Best Western Hotel", "Best
+ * Buy Pharmacy" — all real businesses, none pet shops. The post-filter now
+ * drops results whose Foursquare category name doesn't semantically match
+ * the hint (e.g. for "pet shops" we keep "Pet Store", "Pet Supplies", "Vet
+ * Clinic"; we drop "Hotel", "Restaurant", "Pharmacy").
  */
 async function fetchFoursquarePlaces(businessHint, geo, apiKey) {
   if (!apiKey || !geo || !geo.lat || !geo.lon) return [];
   try {
-    const url = `https://places-api.foursquare.com/places/search?query=${encodeURIComponent(businessHint || '')}&ll=${geo.lat},${geo.lon}&radius=5000&limit=20`;
+    // Pass the raw hint as `query` — Foursquare uses it for a loose name+
+    // category text match. We'll post-filter by category.
+    const url = `https://places-api.foursquare.com/places/search?query=${encodeURIComponent(businessHint || '')}&ll=${geo.lat},${geo.lon}&radius=10000&limit=30`;
     const resp = await fetch(url, {
       headers: {
         'Authorization': `Bearer ${apiKey}`,
@@ -885,23 +969,42 @@ async function fetchFoursquarePlaces(businessHint, geo, apiKey) {
     if (!resp.ok) return [];
     const data = await resp.json();
     const results = data?.results || [];
-    return results.map(r => {
-      const loc = r.location || {};
-      const addr = [ loc.address, loc.locality, loc.region, loc.country ].filter(Boolean).join(', ') || null;
-      const cat = (r.categories && r.categories[0]) || null;
-      return {
-        name: r.name || '',
-        type: cat?.name || (businessHint || 'Local Business'),
-        address: addr,
-        website: r.website || null,
-        phone: r.tel || null,
-        opening_hours: null,
-        lat: r.latitude ?? r.geocodes?.main?.latitude ?? null,
-        lon: r.longitude ?? r.geocodes?.main?.longitude ?? null,
-        osm_url: r.link ? `https://foursquare.com${r.link}` : `https://foursquare.com/v/${r.fsq_place_id || r.fsq_id || ''}`,
-        source: 'Foursquare',
-      };
-    }).filter(p => p.name);
+
+    // v1.5.53 — category post-filter. Build the synonym list once per call.
+    const synonyms = fsqCategorySynonyms(businessHint);
+    const hasSynonyms = synonyms.length > 0;
+
+    return results
+      .map(r => {
+        const loc = r.location || {};
+        const addr = [ loc.address, loc.locality, loc.region, loc.country ].filter(Boolean).join(', ') || null;
+        const cat = (r.categories && r.categories[0]) || null;
+        const catName = (cat && cat.name) ? String(cat.name).toLowerCase() : '';
+        return {
+          name: r.name || '',
+          type: cat?.name || (businessHint || 'Local Business'),
+          _catName: catName, // temporary field for post-filter
+          address: addr,
+          website: r.website || null,
+          phone: r.tel || null,
+          opening_hours: null,
+          lat: r.latitude ?? r.geocodes?.main?.latitude ?? null,
+          lon: r.longitude ?? r.geocodes?.main?.longitude ?? null,
+          osm_url: r.link ? `https://foursquare.com${r.link}` : `https://foursquare.com/v/${r.fsq_place_id || r.fsq_id || ''}`,
+          source: 'Foursquare',
+        };
+      })
+      .filter(p => {
+        if (!p.name) return false;
+        // If we have a synonym list, the result category must match at least
+        // one of the synonyms. No synonyms means unknown business type — let
+        // everything through (pre-v1.5.53 behavior).
+        if (!hasSynonyms) return true;
+        if (!p._catName) return false; // no category = reject when we're filtering
+        return synonyms.some(s => p._catName.includes(s.toLowerCase()));
+      })
+      .map(p => { delete p._catName; return p; })
+      .slice(0, 20);
   } catch { return []; }
 }
 
