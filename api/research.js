@@ -3180,6 +3180,20 @@ function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryD
   }
 
   // ---- Brave Search (real web statistics — Pro only) ----
+  // v1.5.62 — drop dev.to + lemmy sources entirely unless the article
+  // domain is technology/blockchain/cryptocurrency. dev.to always returns
+  // tech blog posts regardless of query, polluting pet/health/travel
+  // articles with irrelevant developer content (live test returned
+  // "April Fools Challenge" and "9 Things You're Overengineering" as
+  // references for a raw dog food article).
+  const isTechDomain = ['technology', 'blockchain', 'cryptocurrency'].includes(String(domain || '').toLowerCase());
+  if (!isTechDomain) {
+    if (social) {
+      social.devto = null;
+      social.lemmy = null;
+    }
+  }
+
   if (brave?.results?.length) {
     brave.results.forEach(r => {
       // Extract statistics from search snippets
