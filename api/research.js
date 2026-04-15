@@ -39,6 +39,30 @@ export default async function handler(req, res) {
   rateLimitStore.set(rateKey, count + 1);
 
   try {
+    // v1.5.50 — TEST MODE short-circuit. When the plugin's Settings → Test
+    // Places Providers button fires, we only care about the places waterfall;
+    // all the other always-on research sources (Reddit, HN, Wikipedia, DDG,
+    // Bluesky, Mastodon, Dev.to, Lemmy, category APIs) add latency and, more
+    // importantly, any one of them throwing an unhandled error nukes the
+    // whole Promise.all and surfaces as the "Unexpected token '<' ..."
+    // JSON-parse-on-HTML error that caused the test button to fail. Skip
+    // them entirely in test mode and return just the places waterfall shape.
+    if (test_all_places_tiers) {
+      const placesData = await fetchPlacesWaterfall(keyword, country, places_keys || {}, { runAllTiers: true });
+      return res.status(200).json({
+        success: true,
+        keyword,
+        test_mode: true,
+        places: placesData.places || [],
+        places_count: (placesData.places || []).length,
+        places_location: placesData.location || null,
+        places_business_type: placesData.business_type || null,
+        places_provider_used: placesData.provider_used || null,
+        places_providers_tried: placesData.providers_tried || [],
+        is_local_intent: !!placesData.isLocal,
+      });
+    }
+
     // Free sources — always run
     const freeSearches = [
       searchReddit(keyword),
