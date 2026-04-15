@@ -46,13 +46,27 @@ export default async function handler(req, res) {
     // phrase since they handle long queries correctly.
     const coreTopic = extractCoreTopic(niche);
 
-    // Run all 4 sources in parallel
-    const [suggest, datamuse, wiki, reddit] = await Promise.all([
+    // v1.5.54 — Google Suggest also receives the core topic instead of the
+    // full long-tail niche. Google's suggestqueries endpoint has no
+    // completion data for 8+ word phrases like "best pet shops in mudgee
+    // nsw 2026", so it was silently returning zero suggestions. The core
+    // topic "pet shops" has thousands of completions ("pet shops near me",
+    // "pet shops sydney", "pet shops online", etc) which then flow through
+    // the overlap filter in buildKeywordSets. We run BOTH the full niche
+    // AND the core topic in parallel and merge the results, so if the
+    // long-tail does have any completions we still capture them.
+    const [suggestLong, suggestCore, datamuse, wiki, reddit] = await Promise.all([
       fetchGoogleSuggest(niche),
+      (niche !== coreTopic) ? fetchGoogleSuggest(coreTopic) : Promise.resolve([]),
       fetchDatamuse(coreTopic),
       fetchWikipedia(niche),
       fetchReddit(niche),
     ]);
+    // Merge core-topic suggestions into the main list, deduped
+    const suggest = [...suggestLong];
+    for (const s of suggestCore) {
+      if (!suggest.includes(s)) suggest.push(s);
+    }
 
     // Build topic candidates with scoring
     const topics = buildTopics(niche, suggest, datamuse, wiki, reddit);
@@ -282,13 +296,19 @@ function buildKeywordSets(niche, suggest, datamuse, wiki) {
 
   // Secondary keywords — real Google Suggest variations of the niche.
   // These are full phrases people actually search. 5-7 best fits.
+  // v1.5.54 — overlap filter relaxed from "word length > 3" to "word length
+  // >= 3" so 3-letter niche tokens like "pet", "cat", "gym", "vet", "bar"
+  // count as overlap signals. This was dropping valid suggestions like
+  // "pet supplies online" or "vet clinic near me" because the filter only
+  // looked at words ≥4 chars, so "pet shops in mudgee" → filter words
+  // ["best","shops","mudgee","2026"] missed the core topic word "pet".
   const secondary = [];
+  const nicheParts = nicheLower.split(/\s+/).filter(w => w.length >= 3 && !['the','and','for','with','from','are','you','can','how','why','what','when','where','who','2024','2025','2026','2027','2028'].includes(w));
   for (const s of suggest) {
     const phrase = (s || '').toLowerCase().trim();
     if (!phrase || seen.has(phrase)) continue;
     if (phrase.length < 6 || phrase.length > 80) continue;
     // Must contain the niche or a piece of it (sanity filter)
-    const nicheParts = nicheLower.split(/\s+/).filter(w => w.length > 3);
     const overlaps = nicheParts.some(w => phrase.includes(w));
     if (!overlaps) continue;
     seen.add(phrase);
