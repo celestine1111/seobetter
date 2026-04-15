@@ -1014,145 +1014,170 @@ async function fetchGooglePlaces(businessHint, geo, apiKey) {
 }
 
 /**
+ * v1.5.52 — Single Sonar call with the relaxed prompt + filter. Used by
+ * fetchSonarPlaces both for the initial attempt AND for the sonar-pro retry.
+ * Kept as a standalone helper so the retry logic in the caller is clean.
+ */
+async function callSonar(apiKey, model, keyword, location, geo) {
+  const systemPrompt = `You are a local business research tool. Given a keyword about local businesses in a town or city, search the web and return a JSON object with a "places" array of REAL verified businesses.
+
+Each place entry should include these fields:
+- name (string, REQUIRED): exact business name as it appears on the source page
+- type (string, REQUIRED): short category label like "Pet Shop", "Gelato Shop", "Pizzeria", "Hotel"
+- source_url (string, REQUIRED): the specific web page URL where you found this business (Yelp, TripAdvisor, Google Maps, local directory, business homepage, local blog, Wikipedia)
+- address (string, preferred): full street address with street number and postal code if the source page lists it. If only a street name or suburb is listed, include that. If no address appears anywhere, leave empty — do NOT invent one.
+- website (string, preferred): official business website URL if you find it
+- phone (string, optional): phone number with country code if listed
+- rating (number, optional): star rating on a 1-5 scale if available
+- photo_url (string, optional): a direct https URL to a photo from the source page (og:image, listing thumbnail)
+
+CRITICAL RULES:
+1. Return ONLY real businesses that actually exist. NEVER invent names, NEVER guess addresses.
+2. A business is "verified" if you can cite at least one specific source page for it (source_url is required). Address is preferred but not mandatory — many small-town listings have name + website without a full street number. Include them anyway.
+3. Small towns may have 1-10 real businesses for a given category. Return every one you can verify via at least one source page. Do NOT pad the list. Do NOT skip real businesses just because they lack a full street address.
+4. If you find ZERO real verified businesses, return an empty places array.
+5. Prefer recent (2024-2026) mentions over older sources.
+6. Return valid JSON matching this exact shape: {"places": [{...}, ...]}`;
+
+  const userPrompt = `Keyword: "${keyword}"\nLocation: ${location}\n\nFind every real verified business matching this keyword in this location. Small towns often have 3-10 real businesses across specialist stores, rural suppliers, and chain outlets — include all of them that you can cite with at least one source URL. A business with a name + Yelp/directory URL is verifiable even if no street number is listed. Do NOT skip real businesses because they lack a full address.\n\nOUTPUT FORMAT: Return ONLY a raw JSON object matching the schema {"places": [{name, type, source_url, address, website, phone, rating, photo_url}, ...]}. Do NOT wrap it in markdown code fences. Do NOT add any explanation before or after the JSON. The first character of your response must be "{" and the last must be "}".`;
+
+  const resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+      'HTTP-Referer': 'https://seobetter.vercel.app',
+      'X-Title': 'SEOBetter Places Waterfall',
+    },
+    body: JSON.stringify({
+      model,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+      max_tokens: 3000,
+      temperature: 0.1,
+    }),
+    signal: AbortSignal.timeout(35000),
+  });
+
+  if (!resp.ok) {
+    let errBody = '';
+    try { errBody = (await resp.text()).substring(0, 500); } catch {}
+    throw new Error(`sonar_http_${resp.status}: OpenRouter returned ${resp.status} ${resp.statusText}. Model: ${model}. Body: ${errBody}`);
+  }
+  const data = await resp.json();
+  const content = data?.choices?.[0]?.message?.content || '';
+  if (!content) {
+    throw new Error('sonar_empty_content: OpenRouter response had no message.content. Model: ' + model);
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    const match = content.match(/\{[\s\S]*\}/);
+    if (!match) {
+      throw new Error('sonar_no_json: model returned non-JSON content: ' + content.substring(0, 200));
+    }
+    try { parsed = JSON.parse(match[0]); } catch {
+      throw new Error('sonar_bad_json: regex-extracted content failed to parse: ' + match[0].substring(0, 200));
+    }
+  }
+
+  const rawPlaces = parsed?.places || [];
+  if (!Array.isArray(rawPlaces)) {
+    throw new Error('sonar_bad_shape: parsed response does not have a places array.');
+  }
+
+  // v1.5.52 — relaxed filter. Accept a place if it has a name PLUS at least
+  // one verifiable signal (address OR website OR source_url). Previous filter
+  // (`name && address`) dropped 7 of 10 Mudgee pet shops.
+  return rawPlaces
+    .map(p => {
+      if (!p || typeof p !== 'object') return null;
+      const name = String(p.name || '').trim();
+      if (!name) return null;
+      const address = p.address ? String(p.address).trim() : '';
+      const website = (p.website && /^https?:\/\//.test(p.website)) ? String(p.website).trim() : null;
+      const source_url = (p.source_url && /^https?:\/\//.test(p.source_url)) ? String(p.source_url).trim() : null;
+      // Must have at least ONE verification signal
+      if (!address && !website && !source_url) return null;
+      return {
+        name,
+        type: String(p.type || 'Local Business').trim(),
+        address,
+        website,
+        phone: p.phone ? String(p.phone).trim() : null,
+        rating: (typeof p.rating === 'number' && p.rating > 0 && p.rating <= 5) ? p.rating : null,
+        lat: (typeof p.lat === 'number') ? p.lat : (geo?.lat ?? null),
+        lon: (typeof p.lon === 'number') ? p.lon : (geo?.lon ?? null),
+        source_url,
+        photo_url: (p.photo_url && /^https:\/\//.test(p.photo_url)) ? p.photo_url : null,
+        source: model === 'perplexity/sonar-pro' ? 'Perplexity Sonar Pro' : 'Perplexity Sonar',
+      };
+    })
+    .filter(p => p !== null);
+}
+
+/**
  * v1.5.30 — Perplexity Sonar via OpenRouter (Tier 0 of the Places waterfall).
  *
  * Sonar is a web-search-capable LLM that pulls real business data from
- * TripAdvisor, Yelp, Wikivoyage, and local blogs with citations. Best
- * coverage for small cities worldwide where OSM/Foursquare/HERE have gaps.
+ * TripAdvisor, Yelp, Wikivoyage, Google Maps, and local blogs with citations.
+ * Best coverage for small cities worldwide where OSM/Foursquare/HERE have gaps.
  * User-provided OpenRouter API key.
  *
- * Cost: ~$0.008 per article on `perplexity/sonar` (base), ~$0.06 on
- * `perplexity/sonar-pro` (deeper search). User covers the cost directly
- * via their own OpenRouter account.
+ * v1.5.52: two-attempt strategy. Runs base `perplexity/sonar` first (~$0.008
+ * per call). If the result set is thin (<2 places), retries with
+ * `perplexity/sonar-pro` (~$0.06 per call, much deeper search) and merges.
  *
- * Returns the same normalized place shape as the other fetchers. Returns
- * [] on any error, 401, or JSON parse failure — falls through to OSM.
+ * Returns the same normalized place shape as the other fetchers. Throws on
+ * hard errors so the waterfall error-capture can surface the real cause.
  */
 async function fetchSonarPlaces(keyword, geo, sonarConfig) {
   // v1.5.42 — diagnostic errors returned via thrown Error so the caller can
-  // surface them in the sonar_error telemetry field. Previously this function
-  // swallowed ALL errors into a silent `return []` which made it impossible
-  // for users to diagnose why Sonar wasn't working. Now we throw with a
-  // descriptive prefix and the waterfall catches + reports each.
+  // surface them in the sonar_error telemetry field.
+  // v1.5.52 — two-attempt strategy. Small towns like Mudgee NSW have plenty
+  // of real businesses online but only 2-3 appear with full street addresses
+  // in any single search. Previous filter `p.name && p.address` threw away
+  // 7 of 10 real verified businesses. New approach:
+  //   1. Relax the filter — accept a place if it has a name PLUS at least one
+  //      verifiable signal (address OR website OR source_url). A business
+  //      with name + Yelp URL is still a real verifiable entity.
+  //   2. Relax the system prompt — address goes from "required" to "preferred
+  //      but optional". Website/source_url are also acceptable verification.
+  //   3. Auto-upgrade to perplexity/sonar-pro if the base model returns <2
+  //      usable places on the first attempt. Pro has much deeper web search
+  //      and finds the long tail of businesses the base model skips. Costs
+  //      ~$0.06 extra per retry, only fires when the base is clearly thin.
   if (!sonarConfig || !sonarConfig.key) {
     throw new Error('sonar_no_key: sonarConfig or sonarConfig.key is missing');
   }
   const apiKey = sonarConfig.key;
-  const model = sonarConfig.model || 'perplexity/sonar';
+  const userModel = sonarConfig.model || 'perplexity/sonar';
   const location = (geo && geo.display_name) || '';
   if (!location) {
     throw new Error('sonar_no_location: geo.display_name is empty');
   }
 
   try {
-    const systemPrompt = `You are a local business research tool. Given a keyword about local businesses in a city, search the web and return a JSON object with a "places" array of REAL verified businesses.
-
-Each place entry must include these fields:
-- name (string, required): exact business name
-- address (string, required): full street address including street number and postal code
-- website (string, optional): official business website URL if you find it
-- phone (string, optional): phone number with country code if available
-- source_url (string, required): the specific web page URL where you found this business (TripAdvisor listing page, Yelp listing, Wikivoyage section, local blog post)
-- rating (number, optional): star rating on a 1-5 scale if available
-- type (string, required): short category label like "Ice Cream Shop", "Pizzeria", "Hotel"
-- photo_url (string, optional): a direct https URL to a photo of the business if the source page has one (og:image, first image of the listing, etc). Prefer stable CDN URLs. Skip if unsure.
-
-CRITICAL RULES:
-1. Return ONLY real businesses that exist at real addresses. NEVER invent or guess.
-2. Small towns often have only 1-3 real businesses for a given category — that's fine. Return however many you can actually verify (even just 1 or 2). Do NOT pad the list with fabricated entries to hit a minimum count.
-3. If you find ZERO real verified businesses for this location, return an empty places array — do not invent any.
-4. Prefer recent (2024-2026) mentions over older sources.
-5. Each source_url must be a specific page, not a homepage.
-6. Return valid JSON matching this exact shape: {"places": [{...}, ...]}`;
-
-    // v1.5.43 — Perplexity Sonar does NOT support OpenAI-style
-    // response_format: { type: 'json_object' }. It only accepts 'text',
-    // 'json_schema' (with a required schema field), or 'regex'. Using
-    // json_object produces a hard 400 Bad Request from Perplexity that the
-    // v1.5.42 error surfacing finally revealed. We send plain text and rely
-    // on our existing JSON-extraction parser below to handle the output.
-    // Also wrap the user prompt in explicit "output ONLY raw JSON, no
-    // markdown fences, no explanation" instructions so the model returns
-    // parseable output without the response_format enforcement.
-    const userPrompt = `Keyword: "${keyword}"\nLocation: ${location}\n\nFind every real verified business matching the keyword in this location — even if there are only 1 or 2. Small towns often have very few. Do NOT pad with invented entries.\n\nOUTPUT FORMAT: Return ONLY a raw JSON object matching the schema {"places": [{name, address, website, phone, source_url, rating, type, photo_url}, ...]}. Do NOT wrap it in markdown code fences. Do NOT add any explanation before or after the JSON. The first character of your response must be "{" and the last must be "}".`;
-
-    const resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
-        'HTTP-Referer': 'https://seobetter.vercel.app',
-        'X-Title': 'SEOBetter Places Waterfall',
-      },
-      body: JSON.stringify({
-        model: model,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt },
-        ],
-        // v1.5.43 — removed response_format (Perplexity 400s on json_object).
-        // The existing parser below handles raw JSON + markdown-fenced JSON.
-        max_tokens: 2000,
-        temperature: 0.1,
-      }),
-      signal: AbortSignal.timeout(30000),
-    });
-
-    if (!resp.ok) {
-      // v1.5.42 — read the error body so we can tell the user exactly what
-      // OpenRouter said. Common responses: 401 (bad key), 402 (no credit),
-      // 403 (model not enabled for this key), 404 (wrong model ID), 429
-      // (rate limit), 500 (OpenRouter/Perplexity outage).
-      let errBody = '';
-      try { errBody = (await resp.text()).substring(0, 500); } catch {}
-      throw new Error(`sonar_http_${resp.status}: OpenRouter returned ${resp.status} ${resp.statusText}. Body: ${errBody}`);
-    }
-    const data = await resp.json();
-    const content = data?.choices?.[0]?.message?.content || '';
-    if (!content) {
-      throw new Error('sonar_empty_content: OpenRouter response had no message.content. Full response: ' + JSON.stringify(data).substring(0, 300));
-    }
-
-    let parsed;
-    try {
-      parsed = JSON.parse(content);
-    } catch {
-      // Some models wrap JSON in markdown fences — try to extract
-      const match = content.match(/\{[\s\S]*\}/);
-      if (!match) {
-        throw new Error('sonar_no_json: model returned non-JSON content: ' + content.substring(0, 200));
-      }
-      try { parsed = JSON.parse(match[0]); } catch {
-        throw new Error('sonar_bad_json: regex-extracted content failed to parse: ' + match[0].substring(0, 200));
+    // v1.5.52 — run base model first, retry with sonar-pro if thin.
+    let places = await callSonar(apiKey, userModel, keyword, location, geo);
+    if (places.length < 2 && userModel !== 'perplexity/sonar-pro') {
+      try {
+        const proPlaces = await callSonar(apiKey, 'perplexity/sonar-pro', keyword, location, geo);
+        // Take the union keyed by normalized name
+        const seen = new Set(places.map(p => p.name.toLowerCase().trim()));
+        proPlaces.forEach(p => {
+          const k = p.name.toLowerCase().trim();
+          if (!seen.has(k)) { places.push(p); seen.add(k); }
+        });
+      } catch (proErr) {
+        // Pro retry failure is non-fatal — return whatever the base model gave us
       }
     }
-
-    const places = parsed?.places || [];
-    if (!Array.isArray(places)) {
-      throw new Error('sonar_bad_shape: parsed response does not have a places array. Got: ' + JSON.stringify(parsed).substring(0, 300));
-    }
-
-    return places
-      .filter(p => p && p.name && p.address)
-      .map(p => ({
-        name: String(p.name || '').trim(),
-        type: String(p.type || 'Local Business').trim(),
-        address: String(p.address || '').trim(),
-        website: (p.website && /^https?:\/\//.test(p.website)) ? p.website : null,
-        phone: p.phone ? String(p.phone).trim() : null,
-        rating: (typeof p.rating === 'number' && p.rating > 0 && p.rating <= 5) ? p.rating : null,
-        lat: (typeof p.lat === 'number') ? p.lat : (geo?.lat ?? null),
-        lon: (typeof p.lon === 'number') ? p.lon : (geo?.lon ?? null),
-        source_url: (p.source_url && /^https?:\/\//.test(p.source_url)) ? p.source_url : null,
-        // v1.5.31 — photo URL scraped by Sonar from the source page (og:image,
-        // listing thumbnail, etc). Only https URLs are accepted. May be hot-
-        // linked from a CDN that rotates — acceptable for a post-gen feature
-        // since the article can be regenerated if photos break.
-        photo_url: (p.photo_url && /^https:\/\//.test(p.photo_url)) ? p.photo_url : null,
-        source: 'Perplexity Sonar',
-      }))
-      .filter(p => p.name && p.address)
-      .slice(0, 10);
+    return places.slice(0, 10);
   } catch (innerError) {
     // Re-throw with sonar_ prefix if not already prefixed, so the waterfall
     // can distinguish Sonar errors from OSM/Foursquare/HERE/Google errors.
