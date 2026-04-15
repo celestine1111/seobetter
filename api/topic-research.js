@@ -228,17 +228,66 @@ function extractCoreTopic(query) {
   const countryRe = new RegExp('\\b(' + countries.join('|') + ')\\b', 'gi');
   q = q.replace(countryRe, '');
 
+  // v1.5.59 — aggressively strip action verbs, pronouns, articles,
+  // prepositions, conjunctions, and adverbs. Datamuse's ml= endpoint
+  // works best with 1-3 CONCRETE NOUN queries. Long "how to ..." phrases
+  // like "transition your dog to raw food safely" previously got
+  // truncated to "transition your dog to raw foo" and returned garbage
+  // semantic associations (lion, curb, race, nose) because Datamuse
+  // treated each individual word independently. Stripping filler leaves
+  // "dog raw food" which Datamuse handles correctly.
+  const stopContentWords = [
+    // Action verbs common in how-to/informational queries
+    'transition', 'transitioning', 'introduce', 'introducing', 'train', 'training',
+    'teach', 'teaching', 'feed', 'feeding', 'choose', 'choosing', 'pick', 'picking',
+    'select', 'selecting', 'switch', 'switching', 'change', 'changing', 'move',
+    'moving', 'make', 'making', 'start', 'starting', 'begin', 'beginning', 'stop',
+    'stopping', 'prepare', 'preparing', 'give', 'giving', 'find', 'finding', 'know',
+    'knowing', 'understand', 'use', 'using', 'try', 'trying', 'help', 'helping',
+    'keep', 'keeping', 'avoid', 'avoiding', 'prevent', 'preventing', 'fix', 'fixing',
+    'solve', 'solving', 'improve', 'improving', 'learn', 'learning', 'safely',
+    'quickly', 'easily', 'properly', 'correctly', 'slowly', 'carefully', 'gradually',
+    'naturally', 'effectively', 'efficiently',
+    // Articles + pronouns
+    'a', 'an', 'the', 'your', 'my', 'his', 'her', 'their', 'our', 'its', 'some',
+    // Prepositions
+    'to', 'for', 'from', 'with', 'about', 'into', 'onto', 'by', 'of', 'on', 'at',
+    'as', 'like', 'up', 'down', 'off', 'out', 'over', 'under',
+    // Conjunctions
+    'and', 'or', 'but', 'so', 'if', 'then', 'that', 'than', 'because',
+    // Generic nouns that add no topic signal
+    'way', 'ways', 'method', 'methods', 'step', 'steps', 'thing', 'things', 'type',
+    'types', 'kind', 'kinds', 'sort', 'sorts', 'option', 'options',
+  ];
+  const stopContentRe = new RegExp('\\b(' + stopContentWords.join('|') + ')\\b', 'gi');
+  q = q.replace(stopContentRe, '');
+
   // Collapse whitespace
   q = q.replace(/\s+/g, ' ').trim();
 
-  // If we stripped too much, fall back to the last 3 words of the original
+  // If we stripped too much, fall back to the last 3 content words of the original
   if (q.length < 3) {
-    const words = query.toLowerCase().trim().split(/\s+/);
+    const allStopWords = new Set([
+      ...stopQualifiers.flatMap(s => s.split(/\s+/)),
+      ...stopContentWords,
+      ...countries,
+    ]);
+    const words = query.toLowerCase().trim().split(/\s+/)
+      .filter(w => w.length >= 3 && !allStopWords.has(w) && !/^\d+$/.test(w));
     q = words.slice(-3).join(' ');
   }
 
-  // Cap at 30 chars to keep Datamuse happy
-  if (q.length > 30) q = q.substring(0, 30).trim();
+  // v1.5.59 — cap at 3 words (not 30 chars). Datamuse's ml= endpoint works
+  // best with 1-3 noun queries. Character truncation previously cut "raw
+  // food" to "raw foo" which matched the wrong semantic cluster.
+  const topicWords = q.split(/\s+/).filter(w => w.length >= 3);
+  if (topicWords.length > 3) {
+    // Prefer the LAST 3 content words (the topic usually comes at the end
+    // after the verbs/qualifiers are stripped).
+    q = topicWords.slice(-3).join(' ');
+  } else {
+    q = topicWords.join(' ');
+  }
 
   return q;
 }
