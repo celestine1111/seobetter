@@ -24,7 +24,7 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Use POST.' });
 
-  const { keyword, site_url, brave_key, domain, country, places_keys } = req.body || {};
+  const { keyword, site_url, brave_key, domain, country, places_keys, test_all_places_tiers } = req.body || {};
 
   if (!keyword) {
     return res.status(400).json({ error: 'keyword is required.' });
@@ -55,7 +55,7 @@ export default async function handler(req, res) {
       // Replaces the v1.5.23 OSM-only fetcher. Stops at first tier returning >=3
       // verified places. User-provided API keys flow in via places_keys from
       // Trend_Researcher.php::cloud_research(); tiers with no key are skipped.
-      fetchPlacesWaterfall(keyword, country, places_keys || {}),
+      fetchPlacesWaterfall(keyword, country, places_keys || {}, { runAllTiers: !!test_all_places_tiers }),
     ];
 
     // Pro source — only if Brave key provided
@@ -1054,7 +1054,13 @@ CRITICAL RULES:
  * provider_used, lat, lon }`. Always returns a valid shape (empty places
  * on any failure) so article generation never breaks on this path.
  */
-async function fetchPlacesWaterfall(keyword, country, placesKeys = {}) {
+async function fetchPlacesWaterfall(keyword, country, placesKeys = {}, opts = {}) {
+  // v1.5.49 — runAllTiers=true disables the short-circuit so every configured
+  // tier is called and reports its own count independently. Used only by the
+  // Settings → Test Places Providers diagnostic so users can verify Foursquare
+  // and HERE keys are actually being called (normal article generation never
+  // reaches those tiers if Sonar/OSM already returned ≥2 results).
+  const runAllTiers = !!opts.runAllTiers;
   const intent = detectLocalIntent(keyword);
   if (!intent.isLocal) {
     return { places: [], location: null, isLocal: false, business_type: null, providers_tried: [], provider_used: null };
@@ -1104,11 +1110,11 @@ async function fetchPlacesWaterfall(keyword, country, placesKeys = {}) {
   }
 
   // ---- Tier 1: OSM / Overpass (free, always on) ----
-  if (!provider_used && businessMatch && geo.bbox) {
+  if ((runAllTiers || !provider_used) && businessMatch && geo.bbox) {
     const osmPlaces = await overpassQuery(businessMatch.tags, geo.bbox, businessMatch.label);
     places = places.concat(osmPlaces);
     providers_tried.push({ name: 'OpenStreetMap', count: osmPlaces.length });
-    if (places.length >= 2) provider_used = 'OpenStreetMap';
+    if (places.length >= 2 && !provider_used) provider_used = 'OpenStreetMap';
   }
 
   // ---- Tier 2: Wikidata — REMOVED in v1.5.26 ----
@@ -1124,27 +1130,51 @@ async function fetchPlacesWaterfall(keyword, country, placesKeys = {}) {
   // ("oldest churches in X") but is no longer called by the business waterfall.
 
   // ---- Tier 2: Foursquare (free, user key) ----
-  if (!provider_used && placesKeys && placesKeys.foursquare) {
-    const fsq = await fetchFoursquarePlaces(businessHint, geo, placesKeys.foursquare);
-    places = places.concat(fsq);
-    providers_tried.push({ name: 'Foursquare', count: fsq.length });
-    if (places.length >= 2) provider_used = 'Foursquare';
+  if ((runAllTiers || !provider_used) && placesKeys && placesKeys.foursquare) {
+    try {
+      const fsq = await fetchFoursquarePlaces(businessHint, geo, placesKeys.foursquare);
+      places = places.concat(fsq);
+      providers_tried.push({ name: 'Foursquare', count: fsq.length });
+      if (places.length >= 2 && !provider_used) provider_used = 'Foursquare';
+    } catch (fsqErr) {
+      providers_tried.push({
+        name: 'Foursquare',
+        count: 0,
+        error: (fsqErr && fsqErr.message) ? fsqErr.message : String(fsqErr),
+      });
+    }
   }
 
   // ---- Tier 4: HERE Places (free, user key) ----
-  if (!provider_used && placesKeys && placesKeys.here) {
-    const here = await fetchHEREPlaces(businessHint, geo, placesKeys.here);
-    places = places.concat(here);
-    providers_tried.push({ name: 'HERE', count: here.length });
-    if (places.length >= 2) provider_used = 'HERE';
+  if ((runAllTiers || !provider_used) && placesKeys && placesKeys.here) {
+    try {
+      const here = await fetchHEREPlaces(businessHint, geo, placesKeys.here);
+      places = places.concat(here);
+      providers_tried.push({ name: 'HERE', count: here.length });
+      if (places.length >= 2 && !provider_used) provider_used = 'HERE';
+    } catch (hereErr) {
+      providers_tried.push({
+        name: 'HERE',
+        count: 0,
+        error: (hereErr && hereErr.message) ? hereErr.message : String(hereErr),
+      });
+    }
   }
 
   // ---- Tier 5: Google Places (paid, user key) ----
-  if (!provider_used && placesKeys && placesKeys.google) {
-    const google = await fetchGooglePlaces(businessHint, geo, placesKeys.google);
-    places = places.concat(google);
-    providers_tried.push({ name: 'Google Places', count: google.length });
-    if (places.length >= 2) provider_used = 'Google Places';
+  if ((runAllTiers || !provider_used) && placesKeys && placesKeys.google) {
+    try {
+      const google = await fetchGooglePlaces(businessHint, geo, placesKeys.google);
+      places = places.concat(google);
+      providers_tried.push({ name: 'Google Places', count: google.length });
+      if (places.length >= 2 && !provider_used) provider_used = 'Google Places';
+    } catch (googleErr) {
+      providers_tried.push({
+        name: 'Google Places',
+        count: 0,
+        error: (googleErr && googleErr.message) ? googleErr.message : String(googleErr),
+      });
+    }
   }
 
   // Deduplicate by lowercased name — the same place may appear in multiple
