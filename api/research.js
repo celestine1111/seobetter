@@ -945,7 +945,16 @@ CRITICAL RULES:
 5. Each source_url must be a specific page, not a homepage.
 6. Return valid JSON matching this exact shape: {"places": [{...}, ...]}`;
 
-    const userPrompt = `Keyword: "${keyword}"\nLocation: ${location}\n\nFind every real verified business matching the keyword in this location — even if there are only 1 or 2. Small towns often have very few. Return them as JSON. Do NOT pad with invented entries.`;
+    // v1.5.43 — Perplexity Sonar does NOT support OpenAI-style
+    // response_format: { type: 'json_object' }. It only accepts 'text',
+    // 'json_schema' (with a required schema field), or 'regex'. Using
+    // json_object produces a hard 400 Bad Request from Perplexity that the
+    // v1.5.42 error surfacing finally revealed. We send plain text and rely
+    // on our existing JSON-extraction parser below to handle the output.
+    // Also wrap the user prompt in explicit "output ONLY raw JSON, no
+    // markdown fences, no explanation" instructions so the model returns
+    // parseable output without the response_format enforcement.
+    const userPrompt = `Keyword: "${keyword}"\nLocation: ${location}\n\nFind every real verified business matching the keyword in this location — even if there are only 1 or 2. Small towns often have very few. Do NOT pad with invented entries.\n\nOUTPUT FORMAT: Return ONLY a raw JSON object matching the schema {"places": [{name, address, website, phone, source_url, rating, type, photo_url}, ...]}. Do NOT wrap it in markdown code fences. Do NOT add any explanation before or after the JSON. The first character of your response must be "{" and the last must be "}".`;
 
     const resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
@@ -961,7 +970,8 @@ CRITICAL RULES:
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt },
         ],
-        response_format: { type: 'json_object' },
+        // v1.5.43 — removed response_format (Perplexity 400s on json_object).
+        // The existing parser below handles raw JSON + markdown-fenced JSON.
         max_tokens: 2000,
         temperature: 0.1,
       }),
