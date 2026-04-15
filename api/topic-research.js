@@ -25,8 +25,10 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Use POST.' });
 
-  const { niche, site_url } = req.body || {};
+  const { niche, site_url, country } = req.body || {};
   if (!niche) return res.status(400).json({ error: 'niche is required.' });
+  // v1.5.57 — accept country code to geo-localize Google Suggest completions
+  const gl = (country && typeof country === 'string') ? country.toLowerCase().slice(0, 2) : '';
 
   // Rate limit
   const rateKey = `${site_url || 'unknown'}_${new Date().getHours()}`;
@@ -56,8 +58,8 @@ export default async function handler(req, res) {
     // AND the core topic in parallel and merge the results, so if the
     // long-tail does have any completions we still capture them.
     const [suggestLong, suggestCore, datamuse, wiki, reddit] = await Promise.all([
-      fetchGoogleSuggest(niche),
-      (niche !== coreTopic) ? fetchGoogleSuggest(coreTopic) : Promise.resolve([]),
+      fetchGoogleSuggest(niche, gl),
+      (niche !== coreTopic) ? fetchGoogleSuggest(coreTopic, gl) : Promise.resolve([]),
       fetchDatamuse(coreTopic),
       fetchWikipedia(niche),
       fetchReddit(niche),
@@ -100,7 +102,7 @@ export default async function handler(req, res) {
 // ============================================================
 // Source 1: Google Suggest (real search queries)
 // ============================================================
-async function fetchGoogleSuggest(query) {
+async function fetchGoogleSuggest(query, gl = '') {
   const variations = [
     query,
     'best ' + query,
@@ -111,10 +113,16 @@ async function fetchGoogleSuggest(query) {
     'what is ' + query,
   ];
 
+  // v1.5.57 — geo-localize completions so "pet shops" for an AU user returns
+  // Australian completions ("pet shops sydney", "pet shops melbourne") not
+  // US ones ("pet shops washington", "pet shops florida"). Google Suggest
+  // uses `gl=XX` for country and `hl=XX` for language. We pass both.
+  const geoParams = gl ? `&gl=${encodeURIComponent(gl)}&hl=${encodeURIComponent(gl)}` : '';
+
   const allSuggestions = [];
   for (const v of variations) {
     try {
-      const url = `https://suggestqueries.google.com/complete/search?client=firefox&q=${encodeURIComponent(v)}`;
+      const url = `https://suggestqueries.google.com/complete/search?client=firefox&q=${encodeURIComponent(v)}${geoParams}`;
       const resp = await fetch(url, { signal: AbortSignal.timeout(4000) });
       if (!resp.ok) continue;
       const data = await resp.json();
