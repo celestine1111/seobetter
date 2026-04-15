@@ -902,12 +902,13 @@ Each place entry must include these fields:
 
 CRITICAL RULES:
 1. Return ONLY real businesses that exist at real addresses. NEVER invent or guess.
-2. If you cannot find at least 3 real verified businesses for the given location, return an empty places array.
-3. Prefer recent (2024-2026) mentions over older sources.
-4. Each source_url must be a specific page, not a homepage.
-5. Return valid JSON matching this exact shape: {"places": [{...}, ...]}`;
+2. Small towns often have only 1-3 real businesses for a given category — that's fine. Return however many you can actually verify (even just 1 or 2). Do NOT pad the list with fabricated entries to hit a minimum count.
+3. If you find ZERO real verified businesses for this location, return an empty places array — do not invent any.
+4. Prefer recent (2024-2026) mentions over older sources.
+5. Each source_url must be a specific page, not a homepage.
+6. Return valid JSON matching this exact shape: {"places": [{...}, ...]}`;
 
-    const userPrompt = `Keyword: "${keyword}"\nLocation: ${location}\n\nFind 5-10 real verified businesses matching the keyword in this location and return them as JSON.`;
+    const userPrompt = `Keyword: "${keyword}"\nLocation: ${location}\n\nFind every real verified business matching the keyword in this location — even if there are only 1 or 2. Small towns often have very few. Return them as JSON. Do NOT pad with invented entries.`;
 
     const resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
@@ -1019,7 +1020,7 @@ async function fetchPlacesWaterfall(keyword, country, placesKeys = {}) {
     const sonar = await fetchSonarPlaces(keyword, geo, placesKeys.openrouter_sonar);
     places = places.concat(sonar);
     providers_tried.push({ name: 'Perplexity Sonar', count: sonar.length });
-    if (places.length >= 3) provider_used = 'Perplexity Sonar';
+    if (places.length >= 2) provider_used = 'Perplexity Sonar';
   }
 
   // ---- Tier 1: OSM / Overpass (free, always on) ----
@@ -1027,7 +1028,7 @@ async function fetchPlacesWaterfall(keyword, country, placesKeys = {}) {
     const osmPlaces = await overpassQuery(businessMatch.tags, geo.bbox, businessMatch.label);
     places = places.concat(osmPlaces);
     providers_tried.push({ name: 'OpenStreetMap', count: osmPlaces.length });
-    if (places.length >= 3) provider_used = 'OpenStreetMap';
+    if (places.length >= 2) provider_used = 'OpenStreetMap';
   }
 
   // ---- Tier 2: Wikidata — REMOVED in v1.5.26 ----
@@ -1047,7 +1048,7 @@ async function fetchPlacesWaterfall(keyword, country, placesKeys = {}) {
     const fsq = await fetchFoursquarePlaces(businessHint, geo, placesKeys.foursquare);
     places = places.concat(fsq);
     providers_tried.push({ name: 'Foursquare', count: fsq.length });
-    if (places.length >= 3) provider_used = 'Foursquare';
+    if (places.length >= 2) provider_used = 'Foursquare';
   }
 
   // ---- Tier 4: HERE Places (free, user key) ----
@@ -1055,7 +1056,7 @@ async function fetchPlacesWaterfall(keyword, country, placesKeys = {}) {
     const here = await fetchHEREPlaces(businessHint, geo, placesKeys.here);
     places = places.concat(here);
     providers_tried.push({ name: 'HERE', count: here.length });
-    if (places.length >= 3) provider_used = 'HERE';
+    if (places.length >= 2) provider_used = 'HERE';
   }
 
   // ---- Tier 5: Google Places (paid, user key) ----
@@ -1063,7 +1064,7 @@ async function fetchPlacesWaterfall(keyword, country, placesKeys = {}) {
     const google = await fetchGooglePlaces(businessHint, geo, placesKeys.google);
     places = places.concat(google);
     providers_tried.push({ name: 'Google Places', count: google.length });
-    if (places.length >= 3) provider_used = 'Google Places';
+    if (places.length >= 2) provider_used = 'Google Places';
   }
 
   // Deduplicate by lowercased name — the same place may appear in multiple
