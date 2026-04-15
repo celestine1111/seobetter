@@ -151,6 +151,48 @@ async function fetchGoogleSuggest(query, gl = '') {
 //   "how to introduce raw food to a dog"        → "raw food dog"
 //   "dog vitamins australia"                    → "dog vitamins"
 // ============================================================
+/**
+ * v1.5.58 — extract the target location from a niche that contains "in X"
+ * or "near X" (e.g. "best pet shops in mudgee nsw 2026" → ["mudgee", "nsw"]).
+ * Returns an array of location tokens (lowercased, ≥3 chars, stopwords removed).
+ * Empty array if no location clause found.
+ */
+function extractLocationTokens(niche) {
+  if (!niche || typeof niche !== 'string') return [];
+  const n = niche.toLowerCase().trim();
+  const m = n.match(/\b(?:in|near|around|at)\s+(.+?)(?:\s+\d{4})?$/);
+  if (!m) return [];
+  const stop = new Set(['the','and','for','with','from','are','you','can','of','to','a','an','best','top','new','old','nsw','vic','qld','wa','sa','tas','act','nt','usa','uk','us','uae']);
+  return m[1]
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .split(/\s+/)
+    .map(w => w.trim())
+    .filter(w => w.length >= 3 && !stop.has(w) && !/^\d+$/.test(w));
+}
+
+/**
+ * v1.5.58 — blocklist of ~100 common English-speaking cities and US states
+ * that Google Suggest frequently returns as completions for generic topic
+ * queries. Used to filter secondary keyword suggestions so a local article
+ * about (e.g.) Mudgee NSW doesn't end up with "pet shops washington" as a
+ * secondary keyword. Suggestions containing any of these words are rejected
+ * UNLESS they also contain the target location tokens.
+ */
+const OTHER_CITY_BLOCKLIST = new Set([
+  // Major US cities
+  'new york','los angeles','chicago','houston','phoenix','philadelphia','san antonio','san diego','dallas','austin','jacksonville','indianapolis','columbus','charlotte','san francisco','seattle','denver','washington','boston','nashville','baltimore','oklahoma','portland','las vegas','memphis','milwaukee','tucson','fresno','sacramento','atlanta','miami','tampa','cleveland','minneapolis','detroit','pittsburgh','orlando','cincinnati','kansas city','st louis','raleigh','salt lake',
+  // US states (frequent in Google Suggest)
+  'california','texas','florida','georgia','illinois','ohio','michigan','virginia','arizona','colorado','maryland','wisconsin','minnesota','alabama','louisiana','kentucky','oregon','oklahoma','connecticut','iowa','utah','nevada','arkansas','mississippi','kansas','nebraska','idaho','hawaii','maine','montana','alaska','vermont','wyoming',
+  // Major UK/AU/CA cities
+  'london','manchester','birmingham','glasgow','edinburgh','liverpool','bristol','leeds','sheffield','cardiff','belfast',
+  'sydney','melbourne','brisbane','perth','adelaide','darwin','hobart','canberra','gold coast','newcastle','geelong','wollongong',
+  'toronto','montreal','vancouver','calgary','ottawa','edmonton','winnipeg','quebec',
+  // Major EU cities
+  'paris','berlin','madrid','rome','milan','amsterdam','barcelona','munich','vienna','prague','dublin','lisbon','athens','florence','naples','venice','zurich','geneva','brussels','copenhagen','stockholm','oslo','helsinki','warsaw',
+  // Major Asian cities
+  'tokyo','osaka','kyoto','seoul','beijing','shanghai','hong kong','singapore','bangkok','mumbai','delhi','dubai','manila','jakarta',
+]);
+
 function extractCoreTopic(query) {
   if (!query || typeof query !== 'string') return query || '';
   let q = query.toLowerCase().trim();
@@ -310,18 +352,75 @@ function buildKeywordSets(niche, suggest, datamuse, wiki) {
   // "pet supplies online" or "vet clinic near me" because the filter only
   // looked at words ≥4 chars, so "pet shops in mudgee" → filter words
   // ["best","shops","mudgee","2026"] missed the core topic word "pet".
+  // v1.5.58 — location-aware filter. For local-intent keywords like
+  // "best pet shops in mudgee nsw 2026", extract the target location
+  // ("mudgee nsw") and reject any Google Suggest completion that names
+  // a DIFFERENT city. Previously "pet shops sydney" and "pet shops
+  // washington" were accepted because they contained "shops" — valid
+  // overlap but completely wrong for a Mudgee article. Now such
+  // suggestions are dropped unless they also contain a Mudgee/NSW token.
   const secondary = [];
   const nicheParts = nicheLower.split(/\s+/).filter(w => w.length >= 3 && !['the','and','for','with','from','are','you','can','how','why','what','when','where','who','2024','2025','2026','2027','2028'].includes(w));
+  const targetLocationTokens = extractLocationTokens(niche);
+  const hasTargetLocation = targetLocationTokens.length > 0;
+
   for (const s of suggest) {
     const phrase = (s || '').toLowerCase().trim();
     if (!phrase || seen.has(phrase)) continue;
     if (phrase.length < 6 || phrase.length > 80) continue;
+
     // Must contain the niche or a piece of it (sanity filter)
     const overlaps = nicheParts.some(w => phrase.includes(w));
     if (!overlaps) continue;
+
+    // v1.5.58 — location filter. If this keyword is location-specific,
+    // reject suggestions containing a different city from the global
+    // blocklist unless they also contain the target location tokens.
+    if (hasTargetLocation) {
+      const containsTargetLocation = targetLocationTokens.some(t => phrase.includes(t));
+      if (!containsTargetLocation) {
+        // Check if phrase contains any other-city blocklist term
+        let containsOtherCity = false;
+        for (const city of OTHER_CITY_BLOCKLIST) {
+          if (phrase.includes(city)) { containsOtherCity = true; break; }
+        }
+        if (containsOtherCity) continue;
+      }
+    }
+
     seen.add(phrase);
     secondary.push(phrase);
     if (secondary.length >= 7) break;
+  }
+
+  // v1.5.58 — for local-intent keywords, synthesize additional secondary
+  // keywords by combining the target location with common business-type
+  // variations. Real small towns almost never have Google Suggest data
+  // for their specific business types, so Google returns 0-3 phrases
+  // after filtering. Augment with synthetic combinations so the article
+  // has enough secondary keyword signals.
+  if (hasTargetLocation && secondary.length < 5) {
+    const locationStr = targetLocationTokens.slice(0, 2).join(' ');
+    const core = extractCoreTopic(niche);
+    if (core && core.length >= 3) {
+      // Generate variations: "core + location", "location + core",
+      // and a few business-type swaps.
+      const synths = [
+        `${core} ${locationStr}`,
+        `${locationStr} ${core}`,
+        `${core} near ${locationStr}`,
+        `best ${core} ${locationStr}`,
+        `${locationStr} ${core.replace(/shops?/, 'supplies').replace(/stores?/, 'supplies')}`,
+      ];
+      for (const s of synths) {
+        const phrase = s.toLowerCase().trim().replace(/\s+/g, ' ');
+        if (!phrase || seen.has(phrase)) continue;
+        if (phrase === core || phrase === nicheLower) continue;
+        seen.add(phrase);
+        secondary.push(phrase);
+        if (secondary.length >= 7) break;
+      }
+    }
   }
 
   // LSI keywords — semantic single-word terms from Datamuse.
