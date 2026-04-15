@@ -35,10 +35,21 @@ export default async function handler(req, res) {
   rateLimitStore.set(rateKey, count + 1);
 
   try {
-    // Run all 5 sources in parallel
+    // v1.5.35 — extract the core business/topic hint from the niche before
+    // calling Datamuse. Datamuse's ml= endpoint is designed for 1-3 word
+    // queries and returns nonsense (aborigines, balance of payments, lidl,
+    // arsenal, magazine) when given a long-tail phrase like
+    // "best gelato shops in lucignano italy 2026". It treats those as
+    // separate words and finds weak associations to "Italy" or "2026".
+    // Fix: strip location, year, generic qualifiers, then pass the core
+    // 1-3 word topic to Datamuse. Wikipedia + Google Suggest get the full
+    // phrase since they handle long queries correctly.
+    const coreTopic = extractCoreTopic(niche);
+
+    // Run all 4 sources in parallel
     const [suggest, datamuse, wiki, reddit] = await Promise.all([
       fetchGoogleSuggest(niche),
-      fetchDatamuse(niche),
+      fetchDatamuse(coreTopic),
       fetchWikipedia(niche),
       fetchReddit(niche),
     ]);
@@ -107,19 +118,98 @@ async function fetchGoogleSuggest(query) {
 }
 
 // ============================================================
+// v1.5.35 — Extract the core business/topic hint from a long-tail keyword.
+// Strips location names, years, and generic SEO qualifiers ("best", "top",
+// "must-try", "2026", etc) so Datamuse's ml= query receives a short 1-3 word
+// topic it can actually match against.
+//
+// Examples:
+//   "best gelato shops in lucignano italy 2026" → "gelato shops"
+//   "top 10 restaurants in rome italy"          → "restaurants"
+//   "how to introduce raw food to a dog"        → "raw food dog"
+//   "dog vitamins australia"                    → "dog vitamins"
+// ============================================================
+function extractCoreTopic(query) {
+  if (!query || typeof query !== 'string') return query || '';
+  let q = query.toLowerCase().trim();
+
+  // Drop year (4-digit number)
+  q = q.replace(/\b20\d{2}\b/g, '');
+
+  // Drop generic SEO qualifiers
+  const stopQualifiers = [
+    'best', 'top', 'greatest', 'finest', 'cheapest', 'biggest', 'must try',
+    'must-try', 'must have', 'must-have', 'ultimate', 'complete', 'essential',
+    'recommended', 'favorite', 'popular', 'trending', 'new', 'latest',
+    'guide', 'review', 'reviews', 'tips', 'how to', 'what is', 'where to',
+    'which', 'when', 'how', 'why', 'should i', 'should you',
+  ];
+  const qualifierRe = new RegExp('\\b(' + stopQualifiers.map(w => w.replace(' ', '\\s+')).join('|') + ')\\b', 'gi');
+  q = q.replace(qualifierRe, '');
+
+  // Drop "in X [country]" location clauses — keep the business type that
+  // precedes "in". If the query has " in ", everything after is location.
+  const inMatch = q.match(/^(.*?)\s+in\s+/);
+  if (inMatch) {
+    q = inMatch[1];
+  }
+
+  // Drop country/region names that commonly leak into queries
+  const countries = [
+    'italy', 'france', 'spain', 'germany', 'portugal', 'greece', 'uk',
+    'usa', 'america', 'australia', 'canada', 'new zealand', 'japan',
+    'china', 'korea', 'thailand', 'vietnam', 'india', 'mexico', 'brazil',
+    'argentina', 'tuscany', 'lombardy', 'sicily', 'andalusia', 'provence',
+  ];
+  const countryRe = new RegExp('\\b(' + countries.join('|') + ')\\b', 'gi');
+  q = q.replace(countryRe, '');
+
+  // Collapse whitespace
+  q = q.replace(/\s+/g, ' ').trim();
+
+  // If we stripped too much, fall back to the last 3 words of the original
+  if (q.length < 3) {
+    const words = query.toLowerCase().trim().split(/\s+/);
+    q = words.slice(-3).join(' ');
+  }
+
+  // Cap at 30 chars to keep Datamuse happy
+  if (q.length > 30) q = q.substring(0, 30).trim();
+
+  return q;
+}
+
+// ============================================================
 // Source 2: Datamuse (semantic word clusters)
 // ============================================================
 async function fetchDatamuse(query) {
   try {
-    // ml = "means like" — semantically related words
-    const url = `https://api.datamuse.com/words?ml=${encodeURIComponent(query)}&max=20&md=f`;
+    // v1.5.35 — Datamuse ml= returns results with a `score` field (typically
+    // 0-20000). High scores indicate strong semantic relevance. We request
+    // 40 results, then filter by score and POS tags in buildKeywordSets.
+    // md=fp adds frequency + part-of-speech tags per result.
+    const url = `https://api.datamuse.com/words?ml=${encodeURIComponent(query)}&max=40&md=fp`;
     const resp = await fetch(url, { signal: AbortSignal.timeout(5000) });
     if (!resp.ok) return [];
     const data = await resp.json();
-    return data.map(d => ({ word: d.word, freq: d.tags ? parseFreq(d.tags) : 0 }));
+    return data.map(d => ({
+      word: d.word,
+      score: d.score || 0,
+      freq: d.tags ? parseFreq(d.tags) : 0,
+      pos: d.tags ? parsePOS(d.tags) : '',
+    }));
   } catch {
     return [];
   }
+}
+
+// v1.5.35 — extract part-of-speech from Datamuse tags array. Returns the
+// first POS tag found ('n', 'v', 'adj', 'adv') or empty string.
+function parsePOS(tags) {
+  for (const t of tags) {
+    if (['n', 'v', 'adj', 'adv'].includes(t)) return t;
+  }
+  return '';
 }
 
 function parseFreq(tags) {
@@ -207,16 +297,64 @@ function buildKeywordSets(niche, suggest, datamuse, wiki) {
   }
 
   // LSI keywords — semantic single-word terms from Datamuse.
+  // v1.5.35 — much stricter filtering to prevent garbage like "aborigines",
+  // "balance of payments", "lidl", "arsenal", "magazine" from leaking into
+  // the user's LSI field. Requires:
+  //   1. Datamuse score >= 1000 (below that is weak noise)
+  //   2. Noun or adjective (POS filter) — no verbs, no adverbs
+  //   3. Not a country, brand, or demographic term (blocklist)
+  //   4. Single word or 2-word phrase (no 3+ word junk)
+  //   5. Not a subset of the niche, not in secondary words
+  //
   // 8-10 best fits, deduplicated against secondary phrases.
+  const BLOCKLIST = new Set([
+    // Countries + regions (leak in when Datamuse parses a multi-word query)
+    'italy', 'france', 'spain', 'germany', 'portugal', 'greece', 'england',
+    'britain', 'america', 'australia', 'canada', 'japan', 'china', 'korea',
+    'india', 'mexico', 'brazil', 'russia', 'europe', 'asia', 'africa',
+    'aborigines', 'aboriginal', 'population', 'demographics', 'government',
+    // Economic/political terms (Datamuse loves these for any country query)
+    'economy', 'politics', 'policy', 'balance', 'payments', 'inflation',
+    'gdp', 'tariff', 'trade', 'ministry',
+    // Brands that hit unrelated queries
+    'lidl', 'aldi', 'walmart', 'tesco', 'amazon', 'ebay', 'google',
+    'arsenal', 'chelsea', 'liverpool', 'manchester', 'juventus',
+    // Generic media
+    'magazine', 'newspaper', 'journal', 'blog', 'website', 'article',
+    // Adjectives that mean nothing in LSI
+    'best', 'top', 'great', 'amazing', 'wonderful', 'perfect', 'excellent',
+    'good', 'bad', 'new', 'old', 'recent', 'modern', 'popular',
+    // Meta words
+    'guide', 'review', 'list', 'example', 'type', 'kind', 'sort', 'way',
+    'thing', 'stuff', 'place', 'area', 'region', 'location',
+    // Year-like
+    'year', 'years', 'decade', 'century', 'today', 'tomorrow', 'yesterday',
+  ]);
+
   const lsi = [];
   const secondaryWords = new Set();
   secondary.forEach(s => s.split(/\s+/).forEach(w => secondaryWords.add(w)));
+
+  // Core topic words from the extracted hint — the LSI results should be
+  // semantically clustered around THIS, not around full-sentence noise
+  const coreWords = extractCoreTopic(niche).split(/\s+/).filter(w => w.length > 3);
+
   for (const d of datamuse) {
     const word = (d.word || '').toLowerCase().trim();
     if (!word || word.length < 4 || word.length > 30) continue;
     if (seen.has(word) || secondaryWords.has(word)) continue;
     // Skip exact-match niche words
     if (nicheLower.includes(word)) continue;
+    // v1.5.35 — Datamuse score threshold. Below 1000 is typically noise.
+    if ((d.score || 0) < 1000) continue;
+    // v1.5.35 — POS filter. Keep only nouns and adjectives. Skip verbs,
+    // adverbs, and POS-less results (which are often rare/weird words).
+    if (d.pos && !['n', 'adj'].includes(d.pos)) continue;
+    // v1.5.35 — blocklist filter
+    if (BLOCKLIST.has(word)) continue;
+    // v1.5.35 — phrase junk filter (Datamuse can return multi-word results
+    // which are almost always noise for LSI keyword purposes)
+    if (/\s/.test(word)) continue;
     seen.add(word);
     lsi.push(word);
     if (lsi.length >= 10) break;
