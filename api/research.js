@@ -793,15 +793,36 @@ async function fetchFoursquarePlaces(businessHint, geo, apiKey) {
 async function fetchHEREPlaces(businessHint, geo, apiKey) {
   if (!apiKey || !geo || !geo.lat || !geo.lon) return [];
   try {
-    const url = `https://discover.search.hereapi.com/v1/discover?apiKey=${encodeURIComponent(apiKey)}&q=${encodeURIComponent(businessHint || '')}&at=${geo.lat},${geo.lon}&limit=20&lang=en`;
+    // v1.5.42 — use HERE's `in=bbox` parameter to HARD-bound the search to
+    // ~10km around the geocoded location. The previous `at=` parameter was
+    // only a soft proximity bias, so a shop named "The Best Gelato" in
+    // Stirling UK could outrank a Lucignano Italy query on name match.
+    // Bbox is west,south,east,north degrees. At latitude 43, 0.1 deg ≈ 11km.
+    const latDelta = 0.1;
+    const lonDelta = 0.1 / Math.cos(geo.lat * Math.PI / 180);
+    const west  = (geo.lon - lonDelta).toFixed(5);
+    const south = (geo.lat - latDelta).toFixed(5);
+    const east  = (geo.lon + lonDelta).toFixed(5);
+    const north = (geo.lat + latDelta).toFixed(5);
+    const bbox  = `${west},${south},${east},${north}`;
+    const url = `https://discover.search.hereapi.com/v1/discover?apiKey=${encodeURIComponent(apiKey)}&q=${encodeURIComponent(businessHint || '')}&in=bbox:${bbox}&at=${geo.lat},${geo.lon}&limit=20&lang=en`;
     const resp = await fetch(url, {
-      headers: { 'User-Agent': 'SEOBetter/1.5.24 (Research)' },
+      headers: { 'User-Agent': 'SEOBetter/1.5.42 (Research)' },
       signal: AbortSignal.timeout(8000),
     });
     if (!resp.ok) return [];
     const data = await resp.json();
     const items = data?.items || [];
-    return items.map(it => {
+    // v1.5.42 — post-filter: drop any result whose address doesn't contain a
+    // significant word from the geocoded location name. This is the belt to
+    // the bbox's suspenders — if HERE ignores the bbox for any reason, this
+    // catches it. Example: for Lucignano Italy, address must mention
+    // "Lucignano", "Arezzo", "Toscana", "Italia", "Italy", "AR", or "52046".
+    const locationWords = (geo.display_name || '')
+      .split(/[\s,]+/)
+      .filter(w => w.length >= 4)
+      .map(w => w.toLowerCase());
+    const mapped = items.map(it => {
       const addr = it.address?.label || null;
       const cat = it.categories && it.categories[0];
       return {
@@ -813,10 +834,17 @@ async function fetchHEREPlaces(businessHint, geo, apiKey) {
         opening_hours: it.openingHours?.[0]?.text?.[0] || null,
         lat: it.position?.lat || null,
         lon: it.position?.lng || null,
-        osm_url: `https://www.here.com/p/s-${encodeURIComponent(it.id || '')}`,
+        source_url: `https://www.here.com/p/s-${encodeURIComponent(it.id || '')}`,
         source: 'HERE',
       };
     }).filter(p => p.name);
+    // Location sanity check
+    if (locationWords.length === 0) return mapped;
+    return mapped.filter(p => {
+      if (!p.address) return false;
+      const addrLower = p.address.toLowerCase();
+      return locationWords.some(w => addrLower.includes(w));
+    });
   } catch { return []; }
 }
 
@@ -881,11 +909,20 @@ async function fetchGooglePlaces(businessHint, geo, apiKey) {
  * [] on any error, 401, or JSON parse failure — falls through to OSM.
  */
 async function fetchSonarPlaces(keyword, geo, sonarConfig) {
-  if (!sonarConfig || !sonarConfig.key) return [];
+  // v1.5.42 — diagnostic errors returned via thrown Error so the caller can
+  // surface them in the sonar_error telemetry field. Previously this function
+  // swallowed ALL errors into a silent `return []` which made it impossible
+  // for users to diagnose why Sonar wasn't working. Now we throw with a
+  // descriptive prefix and the waterfall catches + reports each.
+  if (!sonarConfig || !sonarConfig.key) {
+    throw new Error('sonar_no_key: sonarConfig or sonarConfig.key is missing');
+  }
   const apiKey = sonarConfig.key;
   const model = sonarConfig.model || 'perplexity/sonar';
   const location = (geo && geo.display_name) || '';
-  if (!location) return [];
+  if (!location) {
+    throw new Error('sonar_no_location: geo.display_name is empty');
+  }
 
   try {
     const systemPrompt = `You are a local business research tool. Given a keyword about local businesses in a city, search the web and return a JSON object with a "places" array of REAL verified businesses.
@@ -931,10 +968,20 @@ CRITICAL RULES:
       signal: AbortSignal.timeout(30000),
     });
 
-    if (!resp.ok) return [];
+    if (!resp.ok) {
+      // v1.5.42 — read the error body so we can tell the user exactly what
+      // OpenRouter said. Common responses: 401 (bad key), 402 (no credit),
+      // 403 (model not enabled for this key), 404 (wrong model ID), 429
+      // (rate limit), 500 (OpenRouter/Perplexity outage).
+      let errBody = '';
+      try { errBody = (await resp.text()).substring(0, 500); } catch {}
+      throw new Error(`sonar_http_${resp.status}: OpenRouter returned ${resp.status} ${resp.statusText}. Body: ${errBody}`);
+    }
     const data = await resp.json();
     const content = data?.choices?.[0]?.message?.content || '';
-    if (!content) return [];
+    if (!content) {
+      throw new Error('sonar_empty_content: OpenRouter response had no message.content. Full response: ' + JSON.stringify(data).substring(0, 300));
+    }
 
     let parsed;
     try {
@@ -942,12 +989,18 @@ CRITICAL RULES:
     } catch {
       // Some models wrap JSON in markdown fences — try to extract
       const match = content.match(/\{[\s\S]*\}/);
-      if (!match) return [];
-      try { parsed = JSON.parse(match[0]); } catch { return []; }
+      if (!match) {
+        throw new Error('sonar_no_json: model returned non-JSON content: ' + content.substring(0, 200));
+      }
+      try { parsed = JSON.parse(match[0]); } catch {
+        throw new Error('sonar_bad_json: regex-extracted content failed to parse: ' + match[0].substring(0, 200));
+      }
     }
 
     const places = parsed?.places || [];
-    if (!Array.isArray(places)) return [];
+    if (!Array.isArray(places)) {
+      throw new Error('sonar_bad_shape: parsed response does not have a places array. Got: ' + JSON.stringify(parsed).substring(0, 300));
+    }
 
     return places
       .filter(p => p && p.name && p.address)
@@ -970,8 +1023,13 @@ CRITICAL RULES:
       }))
       .filter(p => p.name && p.address)
       .slice(0, 10);
-  } catch {
-    return [];
+  } catch (innerError) {
+    // Re-throw with sonar_ prefix if not already prefixed, so the waterfall
+    // can distinguish Sonar errors from OSM/Foursquare/HERE/Google errors.
+    if (innerError && innerError.message && innerError.message.startsWith('sonar_')) {
+      throw innerError;
+    }
+    throw new Error('sonar_exception: ' + (innerError?.message || String(innerError)));
   }
 }
 
@@ -1017,10 +1075,22 @@ async function fetchPlacesWaterfall(keyword, country, placesKeys = {}) {
   // tiny tourist towns but TripAdvisor/Yelp have real listings. User covers
   // the cost via their own OpenRouter account (~$0.008/article on base sonar).
   if (placesKeys && placesKeys.openrouter_sonar && placesKeys.openrouter_sonar.key) {
-    const sonar = await fetchSonarPlaces(keyword, geo, placesKeys.openrouter_sonar);
-    places = places.concat(sonar);
-    providers_tried.push({ name: 'Perplexity Sonar', count: sonar.length });
-    if (places.length >= 2) provider_used = 'Perplexity Sonar';
+    // v1.5.42 — capture Sonar errors instead of swallowing them. The
+    // previous silent return [] in fetchSonarPlaces made it impossible
+    // for users to diagnose what was going wrong — the diagnostic card
+    // just said "Sonar was tried but returned 0" without telling them WHY.
+    try {
+      const sonar = await fetchSonarPlaces(keyword, geo, placesKeys.openrouter_sonar);
+      places = places.concat(sonar);
+      providers_tried.push({ name: 'Perplexity Sonar', count: sonar.length });
+      if (places.length >= 2) provider_used = 'Perplexity Sonar';
+    } catch (sonarErr) {
+      providers_tried.push({
+        name: 'Perplexity Sonar',
+        count: 0,
+        error: (sonarErr && sonarErr.message) ? sonarErr.message : String(sonarErr),
+      });
+    }
   }
 
   // ---- Tier 1: OSM / Overpass (free, always on) ----
