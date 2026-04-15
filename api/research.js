@@ -3007,7 +3007,7 @@ function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryD
     } else {
       const triedList = (placesData.providers_tried || []).map(t => `${t.name} (${t.count})`).join(', ');
       const triedSuffix = triedList ? ` Providers tried: ${triedList}.` : '';
-      p.push(`\nLOCAL-INTENT WARNING: This keyword asks about local businesses but the Places waterfall returned ZERO verified places.${triedSuffix} The location may be too small for open-map coverage OR the business type wasn't recognized. DO NOT invent business names. Per PLACES RULES, write a general informational article without naming specific businesses, and add a disclaimer paragraph at the end suggesting readers check Google Maps or OpenStreetMap directly. The user can configure free Foursquare/HERE or paid Google Places API keys in SEOBetter Settings → Integrations for better small-city coverage.`);
+      p.push(`\nLOCAL-INTENT WARNING: This keyword asks about local businesses but the Places waterfall returned ZERO verified places.${triedSuffix} DO NOT invent business names. Per PLACES RULES #6, write a general informational article about the category/region without naming any specific businesses. DO NOT add any disclaimer, note, or meta-explanation in the article body about missing data, unavailable sources, Google Maps, OpenStreetMap, or the plugin's grounding process. The reader must never see those words. The plugin surfaces the missing-data notice in a separate admin panel — the article body stays clean and reader-facing.`);
     }
   }
 
