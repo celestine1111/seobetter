@@ -172,10 +172,11 @@ export default async function handler(req, res) {
       searchDevTo(keyword),
       searchLemmy(keyword),
       // v1.5.24 — 5-tier Places waterfall (OSM → Wikidata → Foursquare → HERE → Google)
-      // Replaces the v1.5.23 OSM-only fetcher. Stops at first tier returning >=3
-      // verified places. User-provided API keys flow in via places_keys from
-      // Trend_Researcher.php::cloud_research(); tiers with no key are skipped.
       fetchPlacesWaterfall(keyword, country, places_keys || {}, { runAllTiers: !!test_all_places_tiers }),
+      // v1.5.81 — Server-side Sonar research. Uses OPENROUTER_KEY env var (Ben's key).
+      // Returns citations, quotes, stats, table data from Perplexity live web search.
+      // Works for ALL users regardless of their AI provider. No extra latency (parallel).
+      fetchSonarResearch(keyword),
     ];
 
     // Pro source — only if Brave key provided
@@ -195,7 +196,7 @@ export default async function handler(req, res) {
       Promise.all(catPromises),
     ]);
 
-    const [redditData, hnData, wikiData, trendsData, ddgData, blueskyData, mastodonData, devtoData, lemmyData, placesData, ...extraCore] = coreResults;
+    const [redditData, hnData, wikiData, trendsData, ddgData, blueskyData, mastodonData, devtoData, lemmyData, placesData, sonarResearchData, ...extraCore] = coreResults;
     const braveData = brave_key ? extraCore[0] : null;
     // v1.5.16 — package the 4 new social fetchers into one object passed to buildResearchResult
     const socialData = { bluesky: blueskyData, mastodon: mastodonData, devto: devtoData, lemmy: lemmyData };
@@ -207,7 +208,7 @@ export default async function handler(req, res) {
       data: catResults[i],
     }));
 
-    const result = buildResearchResult(keyword, redditData, hnData, wikiData, trendsData, braveData, categoryData, domain, ddgData, socialData, placesData);
+    const result = buildResearchResult(keyword, redditData, hnData, wikiData, trendsData, braveData, categoryData, domain, ddgData, socialData, placesData, sonarResearchData);
 
     return res.status(200).json(result);
   } catch (err) {
@@ -3042,10 +3043,105 @@ function fetchSpaceflightNews(keyword) {
 }
 
 // ============================================================
+// v1.5.81 — SERVER-SIDE SONAR RESEARCH (runs for ALL users)
+// Uses Ben's OPENROUTER_KEY env var, not the user's API key.
+// Returns structured JSON with citations, quotes, stats, table data
+// from Perplexity's live web search. Runs in parallel with all
+// other fetchers — no extra latency.
+// ============================================================
+
+async function fetchSonarResearch(keyword) {
+  const OPENROUTER_KEY = process.env.OPENROUTER_KEY;
+  const SONAR_MODEL = process.env.SONAR_MODEL || 'perplexity/sonar';
+
+  if (!OPENROUTER_KEY) return null; // No server key — graceful skip
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 25000);
+
+    const prompt = `For an article about "${keyword}", find REAL current data from the web.
+
+Return a JSON object with exactly these 4 keys:
+{
+  "citations": [
+    {"url": "https://real-article-url", "title": "Actual Page Title", "source_name": "domain.com"},
+    (5-8 entries. REAL URLs to article pages about this topic, NOT homepages)
+  ],
+  "quotes": [
+    {"text": "The actual finding or expert statement", "source": "Person Name, Title at Organization", "url": "https://source-page"},
+    (2-3 entries. Real statements from real people/organizations about this topic)
+  ],
+  "statistics": [
+    "65% of dog owners prefer grain-free options (Pet Food Industry Association, 2025)",
+    (3-5 entries. Real numbers with real source names and years)
+  ],
+  "table_data": {
+    "columns": ["Name", "Key Feature", "Best For"],
+    "rows": [
+      ["Real Product 1", "Real feature", "Real use case"],
+      (3-5 rows with REAL data. Only include columns where you have real data for every row. Skip Price if unknown.)
+    ]
+  }
+}
+
+CRITICAL RULES:
+- Every URL must be a REAL, currently live web page. NEVER invent URLs.
+- Every statistic must include a REAL source name and year.
+- Every quote must be from a REAL person or organization.
+- Table data must contain REAL product/item information.
+- Return ONLY the JSON object. No markdown fences. No explanation.`;
+
+    const resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${OPENROUTER_KEY}`,
+      },
+      body: JSON.stringify({
+        model: SONAR_MODEL,
+        messages: [
+          { role: 'system', content: 'You are a factual research assistant. Return structured JSON with real, verifiable web data. Never fabricate URLs, statistics, or quotes.' },
+          { role: 'user', content: prompt },
+        ],
+        max_tokens: 3000,
+        temperature: 0.1,
+      }),
+    });
+
+    clearTimeout(timeout);
+
+    if (!resp.ok) return null;
+
+    const data = await resp.json();
+    let content = data?.choices?.[0]?.message?.content || '';
+    if (!content) return null;
+
+    // Strip markdown fences if present
+    content = content.replace(/^```(?:json)?\s*\n?/gm, '').replace(/\n?```\s*$/gm, '').trim();
+
+    const parsed = JSON.parse(content);
+    if (!parsed || typeof parsed !== 'object') return null;
+
+    return {
+      citations: Array.isArray(parsed.citations) ? parsed.citations : [],
+      quotes: Array.isArray(parsed.quotes) ? parsed.quotes : [],
+      statistics: Array.isArray(parsed.statistics) ? parsed.statistics : [],
+      table_data: parsed.table_data && typeof parsed.table_data === 'object' ? parsed.table_data : null,
+    };
+  } catch (err) {
+    // Sonar failure is non-fatal — other fetchers still provide data
+    console.error('Sonar research error (non-fatal):', err.message || err);
+    return null;
+  }
+}
+
+// ============================================================
 // BUILD RESULT
 // ============================================================
 
-function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryData, domain, ddg, social, placesData) {
+function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryData, domain, ddg, social, placesData, sonarData) {
   const now = new Date();
   const monthYear = now.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
   const year = now.getFullYear();
@@ -3262,6 +3358,44 @@ function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryD
     });
   }
 
+  // ---- v1.5.81 — Perplexity Sonar Research (server-side, all users) ----
+  // Merge Sonar citations/quotes/stats into the existing arrays so they
+  // flow through the same pipeline as DDG/Reddit/Wikipedia data. Sonar
+  // data is ALSO returned as dedicated fields (sonar_citations, etc.)
+  // so the PHP side can use them for the Citation Pool and inject-fix.
+  if (sonarData) {
+    if (sonarData.citations?.length) {
+      sonarData.citations.forEach(c => {
+        if (!c.url) return;
+        try {
+          const u = new URL(c.url);
+          if (!u.pathname || u.pathname === '/') return; // skip homepages
+          if (u.protocol !== 'https:' && u.protocol !== 'http:') return;
+        } catch { return; }
+        sources.push({
+          url: c.url,
+          title: c.title || '',
+          source_name: c.source_name || new URL(c.url).hostname.replace('www.', ''),
+        });
+      });
+    }
+    if (sonarData.quotes?.length) {
+      sonarData.quotes.forEach(q => {
+        if (!q.text || q.text.length < 15) return;
+        quotes.push({
+          text: q.text.substring(0, 250),
+          source: q.source || 'Industry expert',
+          url: q.url || '',
+        });
+      });
+    }
+    if (sonarData.statistics?.length) {
+      sonarData.statistics.forEach(s => {
+        if (typeof s === 'string' && s.length > 10) stats.push(s);
+      });
+    }
+  }
+
   // ---- v1.5.23 — OSM Places (real local businesses, anti-hallucination grounding) ----
   // Every place found in the waterfall gets added to `sources[]` so the
   // source URL flows through the Citation Pool into the References section. The
@@ -3408,6 +3542,14 @@ function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryD
     places_business_type: placesData?.business_type || null,
     places_provider_used: placesData?.provider_used || null,
     places_providers_tried: placesData?.providers_tried || [],
+
+    // v1.5.81 — Sonar research data (server-side, available to all users)
+    sonar_available: !!sonarData,
+    sonar_citations: sonarData?.citations || [],
+    sonar_quotes: sonarData?.quotes || [],
+    sonar_statistics: sonarData?.statistics || [],
+    sonar_table_data: sonarData?.table_data || null,
+
     searched_at: now.toISOString(),
   };
 }
