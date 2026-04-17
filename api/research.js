@@ -3134,7 +3134,11 @@ async function scrapeAndExtractQuotes(urls, keyword) {
 
       // Must contain at least 1 keyword token
       const matchCount = keyTokens.filter(t => lower.includes(t)).length;
-      if (matchCount < 1) continue;
+      // v1.5.92 — require 2+ keyword tokens, not just 1. A single token
+      // like "food" matches irrelevant pages (Wikipedia "Indigenous cuisine").
+      // 2+ tokens ensures the sentence is actually about the keyword topic.
+      const minTokens = keyTokens.length >= 3 ? 2 : 1;
+      if (matchCount < minTokens) continue;
 
       // Skip junk content (navigation, legal, marketing fluff)
       if (/cookie|privacy policy|copyright|subscribe|newsletter|sign up|log in|terms of|all rights reserved|powered by|add to cart|buy now|checkout/i.test(sentence)) continue;
