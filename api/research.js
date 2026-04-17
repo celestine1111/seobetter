@@ -208,7 +208,23 @@ export default async function handler(req, res) {
       data: catResults[i],
     }));
 
-    const result = buildResearchResult(keyword, redditData, hnData, wikiData, trendsData, braveData, categoryData, domain, ddgData, socialData, placesData, sonarResearchData);
+    // v1.5.88 — Scrape real quotes from DDG/Brave result pages.
+    // Zero hallucination: fetches actual HTML, extracts real sentences.
+    // Runs AFTER DDG/Brave resolve so we have URLs to scrape.
+    const scrapableUrls = [];
+    if (ddgData?.results) {
+      ddgData.results.forEach(r => {
+        if (r.url) scrapableUrls.push({ url: r.url, source_name: r.source || new URL(r.url).hostname.replace(/^www\./, '') });
+      });
+    }
+    if (braveData?.results) {
+      braveData.results.forEach(r => {
+        if (r.url) scrapableUrls.push({ url: r.url, source_name: r.source || new URL(r.url).hostname.replace(/^www\./, '') });
+      });
+    }
+    const scrapedQuotes = scrapableUrls.length > 0 ? await scrapeAndExtractQuotes(scrapableUrls, keyword) : [];
+
+    const result = buildResearchResult(keyword, redditData, hnData, wikiData, trendsData, braveData, categoryData, domain, ddgData, socialData, placesData, sonarResearchData, scrapedQuotes);
 
     return res.status(200).json(result);
   } catch (err) {
@@ -3043,6 +3059,107 @@ function fetchSpaceflightNews(keyword) {
 }
 
 // ============================================================
+// v1.5.88 — REAL PAGE SCRAPING FOR QUOTES (zero hallucination)
+// Fetches actual HTML from DDG/Brave search result URLs, strips
+// to plain text, extracts sentences containing keyword tokens.
+// Every quote is a real sentence from a real page with a real URL.
+// No LLM involved — just fetch + text extraction.
+// ============================================================
+
+async function scrapeAndExtractQuotes(urls, keyword) {
+  if (!urls || !urls.length || !keyword) return [];
+
+  const quotes = [];
+  const keyTokens = keyword.toLowerCase().split(/\s+/).filter(t => t.length >= 4);
+  if (!keyTokens.length) return []; // No usable keyword tokens
+
+  // Fetch up to 5 pages in parallel (5s timeout each)
+  const fetches = urls.slice(0, 5).map(async (entry) => {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
+      const resp = await fetch(entry.url, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' },
+        signal: controller.signal,
+        redirect: 'follow',
+      });
+      clearTimeout(timeout);
+      if (!resp.ok) return null;
+      const contentType = resp.headers.get('content-type') || '';
+      if (!contentType.includes('text/html')) return null;
+      const html = await resp.text();
+      return { html, url: entry.url, source: entry.source_name || new URL(entry.url).hostname.replace(/^www\./, '') };
+    } catch { return null; }
+  });
+
+  const pages = (await Promise.all(fetches)).filter(Boolean);
+
+  for (const page of pages) {
+    // Strip to plain text — remove scripts, styles, nav, header, footer
+    let text = page.html
+      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+      .replace(/<nav[^>]*>[\s\S]*?<\/nav>/gi, '')
+      .replace(/<header[^>]*>[\s\S]*?<\/header>/gi, '')
+      .replace(/<footer[^>]*>[\s\S]*?<\/footer>/gi, '')
+      .replace(/<aside[^>]*>[\s\S]*?<\/aside>/gi, '')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+      .replace(/&#\d+;/g, ' ').replace(/&\w+;/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    // Skip pages with too little content (likely JS-rendered or blocked)
+    if (text.length < 500) continue;
+
+    // Take the main content area (skip first 300 chars which is usually nav/header remnants)
+    const mainText = text.substring(300);
+
+    // Extract sentences (40-250 chars, ending with . ! ?)
+    const sentences = mainText.match(/[A-Z][^.!?]{38,248}[.!?]/g) || [];
+
+    let pageQuoteCount = 0;
+    for (const sentence of sentences) {
+      const lower = sentence.toLowerCase();
+
+      // Must contain at least 1 keyword token
+      const matchCount = keyTokens.filter(t => lower.includes(t)).length;
+      if (matchCount < 1) continue;
+
+      // Skip junk content (navigation, legal, marketing fluff)
+      if (/cookie|privacy policy|copyright|subscribe|newsletter|sign up|log in|terms of|all rights reserved|powered by|add to cart|buy now|checkout/i.test(sentence)) continue;
+
+      // Skip sentences that are too generic (no specific facts or claims)
+      if (/click here|learn more|read more|see also|related articles|share this/i.test(sentence)) continue;
+
+      // Clean up leading punctuation/bullets
+      const clean = sentence.trim().replace(/^\s*[-–—•*]\s*/, '');
+      if (clean.length < 40 || clean.length > 250) continue;
+
+      // Check we don't already have a very similar quote
+      const isDupe = quotes.some(q => {
+        const overlap = clean.substring(0, 30).toLowerCase();
+        return q.text.toLowerCase().includes(overlap);
+      });
+      if (isDupe) continue;
+
+      quotes.push({
+        text: clean,
+        source: page.source,
+        url: page.url,
+      });
+
+      pageQuoteCount++;
+      if (pageQuoteCount >= 2) break; // Max 2 quotes per page
+    }
+
+    if (quotes.length >= 5) break; // Enough quotes total
+  }
+
+  return quotes.slice(0, 5);
+}
+
+// ============================================================
 // v1.5.81 — SERVER-SIDE SONAR RESEARCH (runs for ALL users)
 // Uses Ben's OPENROUTER_KEY env var, not the user's API key.
 // Returns structured JSON with citations, quotes, stats, table data
@@ -3141,7 +3258,7 @@ CRITICAL RULES:
 // BUILD RESULT
 // ============================================================
 
-function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryData, domain, ddg, social, placesData, sonarData) {
+function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryData, domain, ddg, social, placesData, sonarData, scrapedQuotes) {
   const now = new Date();
   const monthYear = now.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
   const year = now.getFullYear();
@@ -3379,21 +3496,28 @@ function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryD
         });
       });
     }
-    if (sonarData.quotes?.length) {
-      sonarData.quotes.forEach(q => {
-        if (!q.text || q.text.length < 15) return;
-        quotes.push({
-          text: q.text.substring(0, 250),
-          source: q.source || 'Industry expert',
-          url: q.url || '',
-        });
-      });
-    }
+    // v1.5.88 — Sonar quotes REMOVED (paraphrased by LLM, unverifiable).
+    // Quotes now come from real page scraping — see scrapedQuotes below.
     if (sonarData.statistics?.length) {
       sonarData.statistics.forEach(s => {
         if (typeof s === 'string' && s.length > 10) stats.push(s);
       });
     }
+  }
+
+  // ---- v1.5.88 — Real scraped quotes (zero hallucination) ----
+  // These are EXACT sentences from REAL web pages, fetched via HTTP and
+  // extracted from the HTML. Every quote has a verifiable source URL.
+  // No LLM involved — just fetch + text extraction.
+  if (scrapedQuotes?.length) {
+    scrapedQuotes.forEach(q => {
+      if (!q.text || !q.url) return;
+      quotes.push({
+        text: q.text,
+        source: q.source || 'web source',
+        url: q.url,
+      });
+    });
   }
 
   // ---- v1.5.23 — OSM Places (real local businesses, anti-hallucination grounding) ----
@@ -3546,7 +3670,7 @@ function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryD
     // v1.5.81 — Sonar research data (server-side, available to all users)
     sonar_available: !!sonarData,
     sonar_citations: sonarData?.citations || [],
-    sonar_quotes: sonarData?.quotes || [],
+    sonar_quotes: scrapedQuotes || [], // v1.5.88: real scraped quotes, not Sonar LLM paraphrases
     sonar_statistics: sonarData?.statistics || [],
     sonar_table_data: sonarData?.table_data || null,
 
