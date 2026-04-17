@@ -208,21 +208,56 @@ export default async function handler(req, res) {
       data: catResults[i],
     }));
 
-    // v1.5.88 — Scrape real quotes from DDG/Brave result pages.
-    // Zero hallucination: fetches actual HTML, extracts real sentences.
-    // Runs AFTER DDG/Brave resolve so we have URLs to scrape.
+    // v1.5.93 — Scrape real quotes from ALL available URL sources.
+    // DDG is blocked on Vercel's IPs (returns 0 results). So we also
+    // use Sonar citation URLs, Reddit post URLs, and any other source
+    // that provides real article URLs. The scraper fetches the page,
+    // strips HTML, extracts real sentences. Zero hallucination.
     const scrapableUrls = [];
+    // Source 1: DDG results (may be 0 on Vercel due to IP blocking)
     if (ddgData?.results) {
       ddgData.results.forEach(r => {
         if (r.url) scrapableUrls.push({ url: r.url, source_name: r.source || new URL(r.url).hostname.replace(/^www\./, '') });
       });
     }
+    // Source 2: Brave results (if Pro key configured)
     if (braveData?.results) {
       braveData.results.forEach(r => {
         if (r.url) scrapableUrls.push({ url: r.url, source_name: r.source || new URL(r.url).hostname.replace(/^www\./, '') });
       });
     }
-    const scrapedQuotes = scrapableUrls.length > 0 ? await scrapeAndExtractQuotes(scrapableUrls, keyword) : [];
+    // Source 3: Sonar citation URLs (most reliable — Sonar works on Vercel)
+    if (sonarResearchData?.citations) {
+      sonarResearchData.citations.forEach(c => {
+        if (c.url) {
+          try {
+            const host = new URL(c.url).hostname.replace(/^www\./, '');
+            scrapableUrls.push({ url: c.url, source_name: c.source_name || host });
+          } catch {}
+        }
+      });
+    }
+    // Source 4: Reddit post URLs that link to external articles
+    if (redditData?.posts) {
+      redditData.posts.forEach(p => {
+        if (p.url && !p.url.includes('reddit.com')) {
+          try {
+            scrapableUrls.push({ url: p.url, source_name: new URL(p.url).hostname.replace(/^www\./, '') });
+          } catch {}
+        }
+      });
+    }
+    // Deduplicate by hostname (don't scrape same site twice)
+    const seenHosts = new Set();
+    const uniqueUrls = scrapableUrls.filter(u => {
+      try {
+        const host = new URL(u.url).hostname;
+        if (seenHosts.has(host)) return false;
+        seenHosts.add(host);
+        return true;
+      } catch { return false; }
+    });
+    const scrapedQuotes = uniqueUrls.length > 0 ? await scrapeAndExtractQuotes(uniqueUrls, keyword) : [];
 
     const result = buildResearchResult(keyword, redditData, hnData, wikiData, trendsData, braveData, categoryData, domain, ddgData, socialData, placesData, sonarResearchData, scrapedQuotes);
 
