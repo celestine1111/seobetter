@@ -165,7 +165,7 @@ export default async function handler(req, res) {
       searchHackerNews(keyword),
       searchWikipedia(keyword),
       searchGoogleTrends(keyword),
-      searchDuckDuckGo(keyword),
+      searchDuckDuckGo(keyword, country),
       // v1.5.16 — additional free social/discussion sources
       searchBluesky(keyword),
       searchMastodon(keyword),
@@ -176,7 +176,7 @@ export default async function handler(req, res) {
       // v1.5.81 — Server-side Sonar research. Uses OPENROUTER_KEY env var (Ben's key).
       // Returns citations, quotes, stats, table data from Perplexity live web search.
       // Works for ALL users regardless of their AI provider. No extra latency (parallel).
-      fetchSonarResearch(keyword),
+      fetchSonarResearch(keyword, country),
     ];
 
     // Pro source — only if Brave key provided
@@ -552,9 +552,19 @@ async function searchBrave(keyword, apiKey) {
  * Uses DDG's HTML endpoint (same as the ddgs Python library).
  * Returns real authoritative web pages for article citations.
  */
-async function searchDuckDuckGo(keyword) {
+async function searchDuckDuckGo(keyword, country = '') {
   try {
-    const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(keyword)}`;
+    // v1.5.88 — add country/region hint to DDG search for geo-targeted results.
+    // DDG supports kl= parameter for region: us-en, au-en, ca-en, uk-en, etc.
+    const regionMap = {
+      'US':'us-en','AU':'au-en','CA':'ca-en','GB':'uk-en','UK':'uk-en',
+      'NZ':'nz-en','IE':'ie-en','IN':'in-en','SG':'sg-en','ZA':'za-en',
+      'DE':'de-de','FR':'fr-fr','ES':'es-es','IT':'it-it','NL':'nl-nl',
+      'BR':'br-pt','MX':'mx-es','JP':'jp-jp','KR':'kr-kr','SE':'se-sv',
+    };
+    const region = regionMap[country?.toUpperCase()] || '';
+    const regionParam = region ? `&kl=${region}` : '';
+    const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(keyword)}${regionParam}`;
     const resp = await fetch(url, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -3167,7 +3177,7 @@ async function scrapeAndExtractQuotes(urls, keyword) {
 // other fetchers — no extra latency.
 // ============================================================
 
-async function fetchSonarResearch(keyword) {
+async function fetchSonarResearch(keyword, country = '') {
   const OPENROUTER_KEY = process.env.OPENROUTER_KEY;
   const SONAR_MODEL = process.env.SONAR_MODEL || 'perplexity/sonar';
 
@@ -3177,7 +3187,8 @@ async function fetchSonarResearch(keyword) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 25000);
 
-    const prompt = `For an article about "${keyword}", find REAL current data from the web.
+    const countryHint = country ? ` Target audience is in ${country}. Prefer sources from ${country} when available.` : '';
+    const prompt = `For an article about "${keyword}", find REAL current data from the web.${countryHint}
 
 Return a JSON object with exactly these 4 keys:
 {
