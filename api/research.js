@@ -3069,8 +3069,8 @@ Return a JSON object with exactly these 4 keys:
     (5-8 entries. REAL URLs to article pages about this topic, NOT homepages)
   ],
   "quotes": [
-    {"text": "The actual finding or expert statement", "source": "Person Name, Title at Organization", "url": "https://source-page"},
-    (2-3 entries. Real statements from real people/organizations about this topic)
+    {"text": "The actual finding or expert statement", "source": "Website or Organization Name", "url": "https://exact-page-where-quote-appears"},
+    (2-3 entries. EVERY quote MUST have a "url" field pointing to the EXACT page where this text appears. If you cannot provide a URL for a quote, do NOT include that quote.)
   ],
   "statistics": [
     "65% of dog owners prefer grain-free options (Pet Food Industry Association, 2025)",
