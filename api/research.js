@@ -165,17 +165,18 @@ export default async function handler(req, res) {
       searchHackerNews(keyword),
       searchWikipedia(keyword),
       searchGoogleTrends(keyword),
-      searchDuckDuckGo(keyword, country),
+      // v1.5.95 — Tavily replaces DDG (blocked on Vercel) as primary web search.
+      // Also extracts real quotes from raw page content. One API call.
+      searchTavily(keyword, country),
+      searchDuckDuckGo(keyword, country), // kept as fallback if Tavily key missing
       // v1.5.16 — additional free social/discussion sources
       searchBluesky(keyword),
       searchMastodon(keyword),
       searchDevTo(keyword),
       searchLemmy(keyword),
-      // v1.5.24 — 5-tier Places waterfall (OSM → Wikidata → Foursquare → HERE → Google)
+      // v1.5.24 — 5-tier Places waterfall
       fetchPlacesWaterfall(keyword, country, places_keys || {}, { runAllTiers: !!test_all_places_tiers }),
-      // v1.5.81 — Server-side Sonar research. Uses OPENROUTER_KEY env var (Ben's key).
-      // Returns citations, quotes, stats, table data from Perplexity live web search.
-      // Works for ALL users regardless of their AI provider. No extra latency (parallel).
+      // v1.5.81 — Sonar research (kept for citations/stats/table, quotes now from Tavily)
       fetchSonarResearch(keyword, country),
     ];
 
@@ -196,7 +197,7 @@ export default async function handler(req, res) {
       Promise.all(catPromises),
     ]);
 
-    const [redditData, hnData, wikiData, trendsData, ddgData, blueskyData, mastodonData, devtoData, lemmyData, placesData, sonarResearchData, ...extraCore] = coreResults;
+    const [redditData, hnData, wikiData, trendsData, tavilyData, ddgData, blueskyData, mastodonData, devtoData, lemmyData, placesData, sonarResearchData, ...extraCore] = coreResults;
     const braveData = brave_key ? extraCore[0] : null;
     // v1.5.16 — package the 4 new social fetchers into one object passed to buildResearchResult
     const socialData = { bluesky: blueskyData, mastodon: mastodonData, devto: devtoData, lemmy: lemmyData };
@@ -208,58 +209,12 @@ export default async function handler(req, res) {
       data: catResults[i],
     }));
 
-    // v1.5.93 — Scrape real quotes from ALL available URL sources.
-    // DDG is blocked on Vercel's IPs (returns 0 results). So we also
-    // use Sonar citation URLs, Reddit post URLs, and any other source
-    // that provides real article URLs. The scraper fetches the page,
-    // strips HTML, extracts real sentences. Zero hallucination.
-    const scrapableUrls = [];
-    // Source 1: DDG results (may be 0 on Vercel due to IP blocking)
-    if (ddgData?.results) {
-      ddgData.results.forEach(r => {
-        if (r.url) scrapableUrls.push({ url: r.url, source_name: r.source || new URL(r.url).hostname.replace(/^www\./, '') });
-      });
-    }
-    // Source 2: Brave results (if Pro key configured)
-    if (braveData?.results) {
-      braveData.results.forEach(r => {
-        if (r.url) scrapableUrls.push({ url: r.url, source_name: r.source || new URL(r.url).hostname.replace(/^www\./, '') });
-      });
-    }
-    // Source 3: Sonar citation URLs (most reliable — Sonar works on Vercel)
-    if (sonarResearchData?.citations) {
-      sonarResearchData.citations.forEach(c => {
-        if (c.url) {
-          try {
-            const host = new URL(c.url).hostname.replace(/^www\./, '');
-            scrapableUrls.push({ url: c.url, source_name: c.source_name || host });
-          } catch {}
-        }
-      });
-    }
-    // Source 4: Reddit post URLs that link to external articles
-    if (redditData?.posts) {
-      redditData.posts.forEach(p => {
-        if (p.url && !p.url.includes('reddit.com')) {
-          try {
-            scrapableUrls.push({ url: p.url, source_name: new URL(p.url).hostname.replace(/^www\./, '') });
-          } catch {}
-        }
-      });
-    }
-    // Deduplicate by hostname (don't scrape same site twice)
-    const seenHosts = new Set();
-    const uniqueUrls = scrapableUrls.filter(u => {
-      try {
-        const host = new URL(u.url).hostname;
-        if (seenHosts.has(host)) return false;
-        seenHosts.add(host);
-        return true;
-      } catch { return false; }
-    });
-    const scrapedQuotes = uniqueUrls.length > 0 ? await scrapeAndExtractQuotes(uniqueUrls, keyword) : [];
+    // v1.5.95 — Tavily provides REAL quotes extracted from REAL page content.
+    // No more scraping pipeline (DDG blocked, Sonar hallucinated).
+    // Tavily's raw_content is the actual page text — quotes are copy-pasted.
+    const tavilyQuotes = tavilyData?.quotes || [];
 
-    const result = buildResearchResult(keyword, redditData, hnData, wikiData, trendsData, braveData, categoryData, domain, ddgData, socialData, placesData, sonarResearchData, scrapedQuotes);
+    const result = buildResearchResult(keyword, redditData, hnData, wikiData, trendsData, braveData, categoryData, domain, ddgData, socialData, placesData, sonarResearchData, tavilyQuotes, tavilyData);
 
     return res.status(200).json(result);
   } catch (err) {
@@ -3104,6 +3059,98 @@ function fetchSpaceflightNews(keyword) {
 }
 
 // ============================================================
+// v1.5.95 — TAVILY SEARCH + CONTENT EXTRACTION
+// Replaces DDG (blocked on Vercel) + Sonar (hallucinated quotes)
+// + scrapeAndExtractQuotes (no URLs to scrape).
+// One API call returns: real URLs + real page content.
+// Quotes extracted from raw_content = real text from real pages.
+// ============================================================
+
+async function searchTavily(keyword, country = '') {
+  const TAVILY_KEY = process.env.TAVILY_API_KEY;
+  if (!TAVILY_KEY) return { results: [], quotes: [] };
+
+  try {
+    const resp = await fetch('https://api.tavily.com/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        api_key: TAVILY_KEY,
+        query: keyword + (country ? ` ${country}` : ''),
+        include_raw_content: true,
+        max_results: 5,
+        search_depth: 'basic',
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+
+    if (!resp.ok) return { results: [], quotes: [], error: `Tavily ${resp.status}` };
+
+    const data = await resp.json();
+    const results = (data?.results || []).map(r => ({
+      title: r.title || '',
+      url: r.url || '',
+      snippet: r.content || '',
+      source: r.url ? new URL(r.url).hostname.replace(/^www\./, '') : '',
+      raw_content: r.raw_content || '',
+    }));
+
+    // Extract REAL quotes from raw_content — no AI, just text extraction
+    const quotes = [];
+    const keyTokens = keyword.toLowerCase().split(/\s+/).filter(t => t.length >= 4);
+    const seenTexts = new Set();
+
+    for (const r of results) {
+      if (!r.raw_content || r.raw_content.length < 500) continue;
+
+      // Clean markdown artifacts from raw content
+      let cleanText = r.raw_content
+        .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')  // strip markdown links
+        .replace(/[*_#>]/g, '')                     // strip formatting
+        .replace(/\s+/g, ' ');
+
+      // Extract sentences (40-220 chars, starts with capital letter)
+      const sentences = cleanText.substring(300).match(/[A-Z][^.!?]{38,218}[.!?]/g) || [];
+      let pageCount = 0;
+
+      for (const s of sentences) {
+        const lower = s.toLowerCase();
+        // Require 2+ keyword tokens (or 1 if keyword has <3 tokens)
+        const minTokens = keyTokens.length >= 3 ? 2 : 1;
+        const matchCount = keyTokens.filter(t => lower.includes(t)).length;
+        if (matchCount < minTokens) continue;
+
+        // Skip junk
+        if (/cookie|privacy|subscribe|menu|click|log in|sign up|copyright|read more|img|src=|alt=|cdn\.|favicon|navigate|breadcrumb/i.test(s)) continue;
+
+        const clean = s.trim();
+        if (clean.length < 40 || clean.length > 220) continue;
+
+        // Dedupe
+        const key = clean.substring(0, 40).toLowerCase();
+        if (seenTexts.has(key)) continue;
+        seenTexts.add(key);
+
+        quotes.push({
+          text: clean,
+          source: r.source,
+          url: r.url,
+        });
+
+        pageCount++;
+        if (pageCount >= 2) break; // Max 2 quotes per page
+      }
+      if (quotes.length >= 5) break;
+    }
+
+    return { results, quotes: quotes.slice(0, 5) };
+  } catch (err) {
+    console.error('Tavily search error:', err.message || err);
+    return { results: [], quotes: [], error: err.message };
+  }
+}
+
+// ============================================================
 // v1.5.88 — REAL PAGE SCRAPING FOR QUOTES (zero hallucination)
 // Fetches actual HTML from DDG/Brave search result URLs, strips
 // to plain text, extracts sentences containing keyword tokens.
@@ -3308,7 +3355,7 @@ CRITICAL RULES:
 // BUILD RESULT
 // ============================================================
 
-function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryData, domain, ddg, social, placesData, sonarData, scrapedQuotes) {
+function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryData, domain, ddg, social, placesData, sonarData, tavilyQuotes, tavilyData) {
   const now = new Date();
   const monthYear = now.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
   const year = now.getFullYear();
@@ -3478,18 +3525,27 @@ function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryD
   // ---- DuckDuckGo Web Search (real authoritative URLs for citations) ----
   if (ddg?.results?.length) {
     ddg.results.forEach(r => {
-      // Extract statistics from snippets
       const statMatches = r.snippet?.match(/\d[\d,\.]*\s*(?:billion|million|thousand|percent|%|\$|USD|EUR)/gi);
       if (statMatches) {
         statMatches.slice(0, 2).forEach(s => {
           stats.push(`${s} — ${r.source} (${year})`);
         });
       }
-      sources.push({
-        url: r.url,
-        title: r.title,
-        source_name: r.source,
-      });
+      sources.push({ url: r.url, title: r.title, source_name: r.source });
+    });
+  }
+
+  // v1.5.95 — Tavily search results as sources (replaces DDG when blocked)
+  if (tavilyData?.results?.length) {
+    tavilyData.results.forEach(r => {
+      if (!r.url) return;
+      const statMatches = r.snippet?.match(/\d[\d,\.]*\s*(?:billion|million|thousand|percent|%|\$|USD|EUR)/gi);
+      if (statMatches) {
+        statMatches.slice(0, 2).forEach(s => {
+          stats.push(`${s} — ${r.source} (${year})`);
+        });
+      }
+      sources.push({ url: r.url, title: r.title, source_name: r.source });
     });
   }
 
@@ -3555,12 +3611,11 @@ function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryD
     }
   }
 
-  // ---- v1.5.88 — Real scraped quotes (zero hallucination) ----
-  // These are EXACT sentences from REAL web pages, fetched via HTTP and
-  // extracted from the HTML. Every quote has a verifiable source URL.
-  // No LLM involved — just fetch + text extraction.
-  if (scrapedQuotes?.length) {
-    scrapedQuotes.forEach(q => {
+  // ---- v1.5.95 — Tavily quotes (real text from real pages) ----
+  // Extracted from Tavily's raw_content — actual page text, not AI-generated.
+  // Every quote has a verified source URL from Tavily's search results.
+  if (tavilyQuotes?.length) {
+    tavilyQuotes.forEach(q => {
       if (!q.text || !q.url) return;
       quotes.push({
         text: q.text,
@@ -3720,7 +3775,7 @@ function buildResearchResult(keyword, reddit, hn, wiki, trends, brave, categoryD
     // v1.5.81 — Sonar research data (server-side, available to all users)
     sonar_available: !!sonarData,
     sonar_citations: sonarData?.citations || [],
-    sonar_quotes: scrapedQuotes || [], // v1.5.88: real scraped quotes, not Sonar LLM paraphrases
+    sonar_quotes: tavilyQuotes || [], // v1.5.95: real quotes from Tavily page content
     sonar_statistics: sonarData?.statistics || [],
     sonar_table_data: sonarData?.table_data || null,
 
