@@ -3078,10 +3078,10 @@ async function searchTavily(keyword, country = '') {
         api_key: TAVILY_KEY,
         query: keyword + (country ? ` ${country}` : ''),
         include_raw_content: true,
-        max_results: 5,
+        max_results: 3,
         search_depth: 'basic',
       }),
-      signal: AbortSignal.timeout(15000),
+      signal: AbortSignal.timeout(8000),
     });
 
     if (!resp.ok) return { results: [], quotes: [], error: `Tavily ${resp.status}` };
