@@ -1,4 +1,9 @@
 {
+  "functions": {
+    "api/research.js": {
+      "maxDuration": 60
+    }
+  },
   "headers": [
     {
       "source": "/api/(.*)",
